@@ -1,0 +1,30 @@
+{
+  "name": "xAI",
+  "backend": "openai",
+  "base_url": "https://api.x.ai",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "XAI_API_KEY",
+  "key_hint": "xai",
+  "tier": 1,
+  "models": [
+    {
+      "id": "grok-3",
+      "display": "Grok 3"
+    },
+    {
+      "id": "grok-3-mini",
+      "display": "Grok 3 Mini"
+    },
+    {
+      "id": "grok-2-1212",
+      "display": "Grok 2"
+    },
+    {
+      "id": "grok-2-vision-1212",
+      "display": "Grok 2 Vision"
+    }
+  ],
+  "default_model": "grok-3"
+}

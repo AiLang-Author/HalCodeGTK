@@ -1,0 +1,38 @@
+{
+  "name": "OpenAI",
+  "backend": "openai",
+  "base_url": "https://api.openai.com",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "OPENAI_API_KEY",
+  "key_hint": "openai",
+  "tier": 1,
+  "models": [
+    {
+      "id": "gpt-4o",
+      "display": "GPT-4o"
+    },
+    {
+      "id": "gpt-4o-mini",
+      "display": "GPT-4o Mini"
+    },
+    {
+      "id": "o1",
+      "display": "o1 (reasoning)"
+    },
+    {
+      "id": "o3-mini",
+      "display": "o3-mini (reasoning)"
+    },
+    {
+      "id": "gpt-4.5-preview",
+      "display": "GPT-4.5 Preview"
+    },
+    {
+      "id": "gpt-4-turbo",
+      "display": "GPT-4 Turbo"
+    }
+  ],
+  "default_model": "gpt-4o"
+}

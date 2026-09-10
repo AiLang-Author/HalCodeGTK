@@ -1,0 +1,30 @@
+{
+  "name": "Anthropic",
+  "backend": "anthropic",
+  "base_url": "https://api.anthropic.com",
+  "api_path": "/v1/messages",
+  "models_endpoint": "/v1/models",
+  "auth": "x-api-key",
+  "key_env": "ANTHROPIC_API_KEY",
+  "key_hint": "anthropic",
+  "tier": 1,
+  "models": [
+    {
+      "id": "claude-3-7-sonnet-20250219",
+      "display": "Claude 3.7 Sonnet"
+    },
+    {
+      "id": "claude-3-5-sonnet-20241022",
+      "display": "Claude 3.5 Sonnet"
+    },
+    {
+      "id": "claude-3-5-haiku-20241022",
+      "display": "Claude 3.5 Haiku"
+    },
+    {
+      "id": "claude-3-opus-20240229",
+      "display": "Claude 3 Opus"
+    }
+  ],
+  "default_model": "claude-3-7-sonnet-20250219"
+}

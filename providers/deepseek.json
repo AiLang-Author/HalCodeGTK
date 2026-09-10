@@ -1,0 +1,35 @@
+{
+  "name": "DeepSeek",
+  "backend": "openai",
+  "base_url": "https://api.deepseek.com",
+  "api_path": "/v1/chat/completions",
+  "models_endpoint": "/v1/models",
+  "auth": "bearer",
+  "key_env": "DEEPSEEK_API_KEY",
+  "key_hint": "deepseek",
+  "tier": 1,
+  "models": [
+    {
+      "id": "deepseek-v4-pro",
+      "display": "DeepSeek V4 Pro (thinking)"
+    },
+    {
+      "id": "deepseek-v4-flash",
+      "display": "DeepSeek V4 Flash (fast)"
+    },
+    {
+      "id": "deepseek-v4-flash-vision-exp",
+      "display": "DeepSeek V4 Vision (exp)"
+    },
+    {
+      "id": "deepseek-chat",
+      "display": "DeepSeek V3 (chat, legacy)"
+    },
+    {
+      "id": "deepseek-reasoner",
+      "display": "DeepSeek R1 (reasoner, legacy)"
+    }
+  ],
+  "default_model": "deepseek-v4-pro",
+  "reasoning_effort": "medium"
+}

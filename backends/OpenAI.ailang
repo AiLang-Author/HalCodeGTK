@@ -1,0 +1,822 @@
+// backends/OpenAI.ailang
+// OpenAI-compatible backend for HalCode9000.
+// Supports OpenAI, Groq, Google Gemini (compat), etc.
+//
+// Public API:
+//   OpenAI.Init
+//   OpenAI.BuildHeaders
+//   OpenAI.BuildRequest
+//   OpenAI.OnEvent
+//   OpenAI.GetPendingTools
+//   OpenAI.CommitAssistantToHistory
+//   OpenAI.AppendToolResultsToHistory
+//   OpenAI.Reset
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+Import.Applications.HalCode9000.History
+Import.Applications.HalCode9000.UI
+
+FixedPool.OAISignal {
+    "CONTINUE":             Initialize=0
+    "TURN_DONE_NO_TOOLS":   Initialize=1
+    "TURN_DONE_WITH_TOOLS": Initialize=2
+}
+
+FixedPool.OAIConst {
+    "TEXT_BUF_SZ":          Initialize=524288
+    "ARGS_BUF_SZ":          Initialize=262144
+    "MAX_TOOLS":            Initialize=16
+    "API_HOST":             Initialize="api.openai.com", CanChange=True
+    "API_PATH":             Initialize="/v1/chat/completions", CanChange=True
+}
+
+FixedPool.OAICfg {
+    "api_key":              Initialize=0, CanChange=True
+    "auth_mode":            Initialize=0, CanChange=True
+    "model":                Initialize=0, CanChange=True
+    "system_prompt":        Initialize=0, CanChange=True
+    "max_tokens":           Initialize=8192, CanChange=True
+    "reasoning_effort":     Initialize=0, CanChange=True  // 0=off, ptr to "min"/"medium"/"max"
+}
+
+FixedPool.OAIState {
+    "text_buf":             Initialize=0, CanChange=True
+    "text_used":            Initialize=0, CanChange=True
+    "reasoning_buf":        Initialize=0, CanChange=True   // current turn COT (streaming in)
+    "reasoning_used":       Initialize=0, CanChange=True
+    "reasoning_prev_buf":   Initialize=0, CanChange=True   // previous turn COT (sent in history)
+    "reasoning_prev_used":  Initialize=0, CanChange=True
+    "tool_slots":           Initialize=0, CanChange=True
+    "tool_count":           Initialize=0, CanChange=True
+    "has_tools_flag":       Initialize=0, CanChange=True
+    "has_stop_flag":        Initialize=0, CanChange=True
+    "last_input_tokens":    Initialize=0, CanChange=True
+    "last_output_tokens":   Initialize=0, CanChange=True
+    "last_cache_hit":       Initialize=0, CanChange=True
+    "rc_chunk_count":       Initialize=0, CanChange=True
+}
+
+Function.OpenAI.Init {
+    Input: auth_mode: Address
+    Input: credential: Address
+    Input: model: Address
+    Input: system_prompt: Address
+    Body: {
+        OAICfg.auth_mode = auth_mode
+        OAICfg.api_key = credential
+        OAICfg.model = model
+        OAICfg.system_prompt = system_prompt
+
+        OAIState.text_buf          = Allocate(OAIConst.TEXT_BUF_SZ)
+        OAIState.reasoning_buf     = Allocate(OAIConst.TEXT_BUF_SZ)
+        OAIState.reasoning_prev_buf = Allocate(OAIConst.TEXT_BUF_SZ)
+        SetByte(OAIState.reasoning_prev_buf, 0, 0)
+        OAIState.reasoning_prev_used = 0
+        OAIState.tool_slots        = Allocate(Multiply(OAIConst.MAX_TOOLS, 32))
+
+        i = 0
+        WhileLoop LessThan(i, OAIConst.MAX_TOOLS) {
+            slot = Add(OAIState.tool_slots, Multiply(i, 32))
+            id_ptr = Allocate(128)
+            name_ptr = Allocate(128)
+            args_ptr = Allocate(OAIConst.ARGS_BUF_SZ)
+
+            StoreValue(Add(slot, 0), id_ptr)
+            StoreValue(Add(slot, 8), name_ptr)
+            StoreValue(Add(slot, 16), args_ptr)
+            StoreValue(Add(slot, 24), 0)
+
+            i = Add(i, 1)
+        }
+        OpenAI.Reset()
+    }
+}
+
+Function.OpenAI.SetURL {
+    Input: base_url: Address
+    Input: api_path: Address
+    Body: {
+        OAIConst.API_HOST = base_url
+        OAIConst.API_PATH = api_path
+    }
+}
+
+Function.OpenAI.SetReasoningEffort {
+    Input: effort: Address  // "min", "medium", "max", or 0 to disable
+    Body: {
+        OAICfg.reasoning_effort = effort
+    }
+}
+
+Function.OpenAI.SetModel {
+    Input: model_name: Address
+    Body: {
+        OAICfg.model = model_name
+    }
+}
+
+Function.OpenAI.PrintUsage {
+    Body: {
+        IfCondition GreaterThan(OAIState.last_input_tokens, 0) ThenBlock: {
+            UI.SetTokens(OAIState.last_input_tokens, OAIState.last_output_tokens)
+        }
+        IfCondition GreaterThan(OAIState.last_cache_hit, 0) ThenBlock: {
+            ch_str = NumberToString(OAIState.last_cache_hit)
+            msg = StringConcat("  cache hit: ", ch_str)
+            msg = StringConcat(msg, " tokens")
+            UI.ChatPrintDim(msg)
+        }
+    }
+}
+
+Function.OpenAI.GetToolName {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(i, OAIConst.MAX_TOOLS) ThenBlock: { ReturnValue(0) }
+        slot = Add(OAIState.tool_slots, Multiply(i, 32))
+        ReturnValue(Dereference(Add(slot, 8)))
+    }
+}
+
+Function.OpenAI.GetToolId {
+    Input: i: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(i, OAIConst.MAX_TOOLS) ThenBlock: { ReturnValue(0) }
+        slot = Add(OAIState.tool_slots, Multiply(i, 32))
+        ReturnValue(Dereference(Add(slot, 0)))
+    }
+}
+
+Function.OpenAI.BuildHeaders {
+    Output: Address
+    Body: {
+        h1 = StringConcat("Authorization: Bearer ", OAICfg.api_key)
+        h2 = StringConcat(h1, "\n")
+        h3 = StringConcat(h2, "Content-Type: application/json\n")
+        ReturnValue(h3)
+    }
+}
+
+Function.OpenAI.BuildRequest {
+    Input: messages_arr: Address
+    Input: tools_arr: Address
+    Output: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "model", OAICfg.model)
+        JSON.SetNumber(req, "max_tokens", OAICfg.max_tokens)
+        JSON.SetBool(req, "stream", 1)
+
+        opts = JSON.NewObject()
+        JSON.SetBool(opts, "include_usage", 1)
+        JSON.SetObject(req, "stream_options", opts)
+
+        // reasoning_effort — DeepSeek V4 thinking control (min/medium/max)
+        IfCondition NotEqual(OAICfg.reasoning_effort, 0) ThenBlock: {
+            JSON.SetString(req, "reasoning_effort", OAICfg.reasoning_effort)
+        }
+
+        new_msgs = JSON.NewArray()
+        sys_msg = JSON.NewObject()
+        JSON.SetString(sys_msg, "role", "system")
+        JSON.SetString(sys_msg, "content", OAICfg.system_prompt)
+        JSON.PushObject(new_msgs, sys_msg)
+
+        msg_len = JSON.ArrayLength(messages_arr)
+        i = 0
+        WhileLoop LessThan(i, msg_len) {
+            m = JSON.ArrayGet(messages_arr, i)
+            m_obj = JSON.AsObject(m)
+            IfCondition NotEqual(m_obj, 0) ThenBlock: {
+                role = JSON.GetString(m_obj, "role")
+                IfCondition NotEqual(role, 0) ThenBlock: {
+                    JSON.PushObject(new_msgs, m_obj)
+                }
+            }
+            i = Add(i, 1)
+        }
+        JSON.SetArray(req, "messages", new_msgs)
+
+        tool_len = JSON.ArrayLength(tools_arr)
+        IfCondition GreaterThan(tool_len, 0) ThenBlock: {
+            new_tools = JSON.NewArray()
+            j = 0
+            WhileLoop LessThan(j, tool_len) {
+                anth_tool_tag = JSON.ArrayGet(tools_arr, j)
+                anth_tool = JSON.AsObject(anth_tool_tag)
+
+                IfCondition NotEqual(anth_tool, 0) ThenBlock: {
+                    oai_tool = JSON.NewObject()
+                    JSON.SetString(oai_tool, "type", "function")
+
+                    fn_obj = JSON.NewObject()
+
+                    tool_name = JSON.GetString(anth_tool, "name")
+                    IfCondition EqualTo(tool_name, 0) ThenBlock: { tool_name = "unknown_tool" }
+                    JSON.SetString(fn_obj, "name", tool_name)
+
+                    tool_desc = JSON.GetString(anth_tool, "description")
+                    IfCondition EqualTo(tool_desc, 0) ThenBlock: { tool_desc = "" }
+                    JSON.SetString(fn_obj, "description", tool_desc)
+
+                    params = JSON.GetObject(anth_tool, "input_schema")
+                    IfCondition NotEqual(params, 0) ThenBlock: {
+                        JSON.SetObject(fn_obj, "parameters", params)
+                    }
+
+                    JSON.SetObject(oai_tool, "function", fn_obj)
+                    JSON.PushObject(new_tools, oai_tool)
+                }
+
+                j = Add(j, 1)
+            }
+            JSON.SetArray(req, "tools", new_tools)
+            JSON.SetString(req, "tool_choice", "auto")
+        }
+
+        ReturnValue(JSON.SerializeObject(req))
+    }
+}
+
+Function.OpenAI_ParseToolCallDelta {
+    Input: tc: Address
+    Body: {
+        idx = JSON.GetNumber(tc, "index")
+
+        IfCondition GreaterEqual(idx, OAIConst.MAX_TOOLS) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        slot = Add(OAIState.tool_slots, Multiply(idx, 32))
+        id_ptr = Dereference(Add(slot, 0))
+        name_ptr = Dereference(Add(slot, 8))
+        args_ptr = Dereference(Add(slot, 16))
+        args_used = Dereference(Add(slot, 24))
+
+        id_str = JSON.GetString(tc, "id")
+        IfCondition NotEqual(id_str, 0) ThenBlock: {
+            i = 0
+            i_used = StringLength(id_ptr)
+            len = StringLength(id_str)
+            WhileLoop LessThan(i, len) {
+                IfCondition LessThan(i_used, 127) ThenBlock: {
+                    SetByte(id_ptr, i_used, GetByte(id_str, i))
+                    i_used = Add(i_used, 1)
+                }
+                i = Add(i, 1)
+            }
+            SetByte(id_ptr, i_used, 0)
+        }
+
+        fn_obj = JSON.GetObject(tc, "function")
+        IfCondition NotEqual(fn_obj, 0) ThenBlock: {
+            name_str = JSON.GetString(fn_obj, "name")
+            IfCondition NotEqual(name_str, 0) ThenBlock: {
+                is_first = 0
+                IfCondition EqualTo(StringLength(name_ptr), 0) ThenBlock: { is_first = 1 }
+                j = 0
+                n_used = StringLength(name_ptr)
+                nlen = StringLength(name_str)
+                WhileLoop LessThan(j, nlen) {
+                    IfCondition LessThan(n_used, 127) ThenBlock: {
+                        SetByte(name_ptr, n_used, GetByte(name_str, j))
+                        n_used = Add(n_used, 1)
+                    }
+                    j = Add(j, 1)
+                }
+                SetByte(name_ptr, n_used, 0)
+
+                IfCondition GreaterEqual(idx, OAIState.tool_count) ThenBlock: {
+                    OAIState.tool_count = Add(idx, 1)
+                }
+                    
+            }
+
+            args_str = JSON.GetString(fn_obj, "arguments")
+            IfCondition NotEqual(args_str, 0) ThenBlock: {
+                k = 0
+                alen = StringLength(args_str)
+                WhileLoop LessThan(k, alen) {
+                    IfCondition LessThan(args_used, Subtract(OAIConst.ARGS_BUF_SZ, 1)) ThenBlock: {
+                        SetByte(args_ptr, args_used, GetByte(args_str, k))
+                        args_used = Add(args_used, 1)
+                    }
+                    k = Add(k, 1)
+                }
+                SetByte(args_ptr, args_used, 0)
+                StoreValue(Add(slot, 24), args_used)
+            }
+        }
+    }
+}
+
+Function.OpenAI.OnEvent {
+    Input: event_type: Address
+    Input: event_data: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(StringCompare(event_data, "[DONE]"), 0) ThenBlock: {
+            // Flush the final reasoning text
+            IfCondition GreaterThan(OAIState.reasoning_used, 0) ThenBlock: {
+                UI.SetReasoning(OAIState.reasoning_buf)
+            }
+            IfCondition EqualTo(OAIState.has_tools_flag, 1) ThenBlock: {
+                ReturnValue(OAISignal.TURN_DONE_WITH_TOOLS)
+            } ElseBlock: {
+                ReturnValue(OAISignal.TURN_DONE_NO_TOOLS)
+            }
+        }
+
+        parsed = ParseJSON(event_data)
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                JSON.Free(parsed)
+            }
+            ReturnValue(OAISignal.CONTINUE)
+        }
+
+        usage = JSON.GetObject(obj, "usage")
+        IfCondition NotEqual(usage, 0) ThenBlock: {
+            OAIState.last_input_tokens = JSON.GetNumber(usage, "prompt_tokens")
+            OAIState.last_output_tokens = JSON.GetNumber(usage, "completion_tokens")
+            // DeepSeek reports automatic cache hits here (0 if not a DeepSeek model)
+            OAIState.last_cache_hit = JSON.GetNumber(usage, "prompt_cache_hit_tokens")
+        }
+
+        choices = JSON.GetArray(obj, "choices")
+        IfCondition NotEqual(choices, 0) ThenBlock: {
+            c_len = JSON.ArrayLength(choices)
+            IfCondition GreaterThan(c_len, 0) ThenBlock: {
+                c0_tag = JSON.ArrayGet(choices, 0)
+                c0 = JSON.AsObject(c0_tag)
+
+                fr = JSON.GetString(c0, "finish_reason")
+                IfCondition NotEqual(fr, 0) ThenBlock: {
+                    IfCondition Or(EqualTo(StringCompare(fr, "tool_calls"), 0), EqualTo(StringCompare(fr, "TOOL_CALLS"), 0)) ThenBlock: {
+                        OAIState.has_tools_flag = 1
+                    }
+                    IfCondition Or(EqualTo(StringCompare(fr, "stop"), 0), EqualTo(StringCompare(fr, "STOP"), 0)) ThenBlock: {
+                        OAIState.has_stop_flag = 1
+                    }
+                }
+
+                delta = JSON.GetObject(c0, "delta")
+                IfCondition NotEqual(delta, 0) ThenBlock: {
+                    // reasoning_content — DeepSeek chain-of-thought.
+                    // Accumulate into reasoning_buf (must be echoed back to API)
+                    // but do NOT display — it clutters the chat stream.
+                    rc = JSON.GetString(delta, "reasoning_content")
+                    IfCondition NotEqual(rc, 0) ThenBlock: {
+                        rclen = StringLength(rc)
+                        IfCondition GreaterThan(rclen, 0) ThenBlock: {
+                            rused = OAIState.reasoning_used
+                            ri = 0
+                            WhileLoop LessThan(ri, rclen) {
+                                IfCondition LessThan(rused, Subtract(OAIConst.TEXT_BUF_SZ, 1)) ThenBlock: {
+                                    SetByte(OAIState.reasoning_buf, rused, GetByte(rc, ri))
+                                    rused = Add(rused, 1)
+                                }
+                                ri = Add(ri, 1)
+                            }
+                            SetByte(OAIState.reasoning_buf, rused, 0)
+                            OAIState.reasoning_used = rused
+                            
+                            // Throttle rendering updates to reduce UI tearing
+                            OAIState.rc_chunk_count = Add(OAIState.rc_chunk_count, 1)
+                            IfCondition EqualTo(Modulo(OAIState.rc_chunk_count, 16), 0) ThenBlock: {
+                                UI.SetReasoning(OAIState.reasoning_buf)
+                            }
+                        }
+                    }
+
+                    content = JSON.GetString(delta, "content")
+                    IfCondition NotEqual(content, 0) ThenBlock: {
+                        clen = StringLength(content)
+                        IfCondition GreaterThan(clen, 0) ThenBlock: {
+                            i = 0
+                            used = OAIState.text_used
+                            WhileLoop LessThan(i, clen) {
+                                IfCondition LessThan(used, Subtract(OAIConst.TEXT_BUF_SZ, 1)) ThenBlock: {
+                                    SetByte(OAIState.text_buf, used, GetByte(content, i))
+                                    used = Add(used, 1)
+                                }
+                                i = Add(i, 1)
+                            }
+                            SetByte(OAIState.text_buf, used, 0)
+                            OAIState.text_used = used
+
+                            UI.ChatPrint(content)
+                        }
+                    }
+
+                    tcs = JSON.GetArray(delta, "tool_calls")
+                    IfCondition NotEqual(tcs, 0) ThenBlock: {
+                        tlen = JSON.ArrayLength(tcs)
+                        j = 0
+                        WhileLoop LessThan(j, tlen) {
+                            tc_tag = JSON.ArrayGet(tcs, j)
+                            tc_obj = JSON.AsObject(tc_tag)
+                            OpenAI_ParseToolCallDelta(tc_obj)
+                            j = Add(j, 1)
+                        }
+                    }
+                }
+            }
+        }
+
+        IfCondition NotEqual(parsed, 0) ThenBlock: {
+            JSON.Free(parsed)
+        }
+        ReturnValue(OAISignal.CONTINUE)
+    }
+}
+
+Function.OpenAI.IsCleanStop {
+    Output: Integer
+    Body: {
+        // If we saw a finish_reason, forgive the missing [DONE] signal.
+        IfCondition Or(EqualTo(OAIState.has_stop_flag, 1), EqualTo(OAIState.has_tools_flag, 1)) ThenBlock: {
+            IfCondition GreaterThan(OAIState.reasoning_used, 0) ThenBlock: {
+                UI.SetReasoning(OAIState.reasoning_buf)
+            }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.OpenAI.GetPendingTools {
+    Output: Address
+    Body: {
+        arr = JSON.NewArray()
+        i = 0
+        WhileLoop LessThan(i, OAIState.tool_count) {
+            slot = Add(OAIState.tool_slots, Multiply(i, 32))
+            id_ptr = Dereference(Add(slot, 0))
+            name_ptr = Dereference(Add(slot, 8))
+            args_ptr = Dereference(Add(slot, 16))
+
+            tu = JSON.NewObject()
+            JSON.SetString(tu, "id", id_ptr)
+            JSON.SetString(tu, "name", name_ptr)
+            
+            parsed_args = JSON.AsObject(ParseJSON(args_ptr))
+            IfCondition EqualTo(parsed_args, 0) ThenBlock: {
+                parsed_args = JSON.NewObject()
+            }
+            JSON.SetObject(tu, "input", parsed_args)
+
+            JSON.PushObject(arr, tu)
+
+            i = Add(i, 1)
+        }
+        ReturnValue(arr)
+    }
+}
+
+// Duplicate a string into a fresh heap allocation so history entries
+// survive Reset() zeroing the source slot buffers.
+Function.OpenAI_StrDup {
+    Input: src: Address
+    Output: Address
+    Body: {
+        slen = StringLength(src)
+        dst = Allocate(Add(slen, 1))
+        k = 0
+        WhileLoop LessThan(k, slen) {
+            SetByte(dst, k, GetByte(src, k))
+            k = Add(k, 1)
+        }
+        SetByte(dst, slen, 0)
+        ReturnValue(dst)
+    }
+}
+
+// Build the assistant history message as a raw JSON string so it never goes
+// through Library.JSON's hash table. This sidesteps the task-#28 collision
+// bug that dropped tool_calls when reasoning_content was in the same object.
+// ParseJSON on the resulting string produces a clean, collision-free object.
+//
+// Memory note: the old implementation chained ~20 StringConcat calls, each of
+// which leaked a fresh arena allocation for the life of the process. This
+// version measures the exact output size, allocates ONCE, and appends into
+// that buffer byte-by-byte. Escaped intermediates are Deallocated after use.
+Function.OpenAI_Append {
+    Input: dst: Address
+    Input: off: Integer
+    Input: src: Address
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop 1 {
+            c = GetByte(src, i)
+            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
+            SetByte(dst, off, c)
+            off = Add(off, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(off)
+    }
+}
+
+Function.OpenAI_BuildAssistantMsgStr {
+    Output: Address
+    Body: {
+        esc_content = JSON.EscapeString(OAIState.text_buf)
+        esc_rc = 0
+        has_rc = 0
+
+        // measure pass: compute the exact output length
+        total = StringLength("{\"role\":\"assistant\",\"content\":\"")
+        total = Add(total, StringLength(esc_content))
+        total = Add(total, StringLength("\""))
+
+        IfCondition GreaterThan(OAIState.reasoning_used, 0) ThenBlock: {
+            has_rc = 1
+            esc_rc = JSON.EscapeString(OAIState.reasoning_buf)
+            total = Add(total, StringLength(",\"reasoning_content\":\""))
+            total = Add(total, StringLength(esc_rc))
+            total = Add(total, StringLength("\""))
+        }
+
+        IfCondition GreaterThan(OAIState.tool_count, 0) ThenBlock: {
+            total = Add(total, StringLength(",\"tool_calls\":["))
+            i = 0
+            WhileLoop LessThan(i, OAIState.tool_count) {
+                IfCondition GreaterThan(i, 0) ThenBlock: {
+                    total = Add(total, StringLength(","))
+                }
+                slot = Add(OAIState.tool_slots, Multiply(i, 32))
+                id_ptr   = Dereference(Add(slot, 0))
+                name_ptr = Dereference(Add(slot, 8))
+                args_ptr = Dereference(Add(slot, 16))
+                safe_args = args_ptr
+                IfCondition EqualTo(args_ptr, 0) ThenBlock: { safe_args = "{}" }
+                IfCondition EqualTo(StringLength(safe_args), 0) ThenBlock: { safe_args = "{}" }
+                esc_id   = JSON.EscapeString(id_ptr)
+                esc_name = JSON.EscapeString(name_ptr)
+                esc_args = JSON.EscapeString(safe_args)
+                total = Add(total, StringLength("{\"id\":\""))
+                total = Add(total, StringLength(esc_id))
+                total = Add(total, StringLength("\",\"type\":\"function\",\"function\":{\"name\":\""))
+                total = Add(total, StringLength(esc_name))
+                total = Add(total, StringLength("\",\"arguments\":\""))
+                total = Add(total, StringLength(esc_args))
+                total = Add(total, StringLength("\"}}"))
+                Deallocate(esc_id, Add(StringLength(esc_id), 1))
+                Deallocate(esc_name, Add(StringLength(esc_name), 1))
+                Deallocate(esc_args, Add(StringLength(esc_args), 1))
+                i = Add(i, 1)
+            }
+            total = Add(total, StringLength("]"))
+        }
+
+        total = Add(total, StringLength("}"))
+
+        // build pass: append into one exact-size buffer
+        buf = Allocate(Add(total, 1))
+        off = 0
+        off = OpenAI_Append(buf, off, "{\"role\":\"assistant\",\"content\":\"")
+        off = OpenAI_Append(buf, off, esc_content)
+        off = OpenAI_Append(buf, off, "\"")
+        Deallocate(esc_content, Add(StringLength(esc_content), 1))
+
+        IfCondition EqualTo(has_rc, 1) ThenBlock: {
+            off = OpenAI_Append(buf, off, ",\"reasoning_content\":\"")
+            off = OpenAI_Append(buf, off, esc_rc)
+            off = OpenAI_Append(buf, off, "\"")
+            Deallocate(esc_rc, Add(StringLength(esc_rc), 1))
+        }
+
+        IfCondition GreaterThan(OAIState.tool_count, 0) ThenBlock: {
+            off = OpenAI_Append(buf, off, ",\"tool_calls\":[")
+            i = 0
+            WhileLoop LessThan(i, OAIState.tool_count) {
+                IfCondition GreaterThan(i, 0) ThenBlock: {
+                    off = OpenAI_Append(buf, off, ",")
+                }
+                slot = Add(OAIState.tool_slots, Multiply(i, 32))
+                id_ptr   = Dereference(Add(slot, 0))
+                name_ptr = Dereference(Add(slot, 8))
+                args_ptr = Dereference(Add(slot, 16))
+                safe_args = args_ptr
+                IfCondition EqualTo(args_ptr, 0) ThenBlock: { safe_args = "{}" }
+                IfCondition EqualTo(StringLength(safe_args), 0) ThenBlock: { safe_args = "{}" }
+                esc_id   = JSON.EscapeString(id_ptr)
+                esc_name = JSON.EscapeString(name_ptr)
+                esc_args = JSON.EscapeString(safe_args)
+                off = OpenAI_Append(buf, off, "{\"id\":\"")
+                off = OpenAI_Append(buf, off, esc_id)
+                off = OpenAI_Append(buf, off, "\",\"type\":\"function\",\"function\":{\"name\":\"")
+                off = OpenAI_Append(buf, off, esc_name)
+                off = OpenAI_Append(buf, off, "\",\"arguments\":\"")
+                off = OpenAI_Append(buf, off, esc_args)
+                off = OpenAI_Append(buf, off, "\"}}")
+                Deallocate(esc_id, Add(StringLength(esc_id), 1))
+                Deallocate(esc_name, Add(StringLength(esc_name), 1))
+                Deallocate(esc_args, Add(StringLength(esc_args), 1))
+                i = Add(i, 1)
+            }
+            off = OpenAI_Append(buf, off, "]")
+        }
+
+        off = OpenAI_Append(buf, off, "}")
+        SetByte(buf, off, 0)
+        ReturnValue(buf)
+    }
+}
+
+Function.OpenAI.CommitAssistantToHistory {
+    Body: {
+        raw = OpenAI_BuildAssistantMsgStr()
+        parsed = ParseJSON(raw)
+        msg = JSON.AsObject(parsed)
+        IfCondition NotEqual(msg, 0) ThenBlock: {
+            History.AppendRaw(msg)
+        } ElseBlock: {
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                JSON.Free(parsed)
+            }
+        }
+        Deallocate(raw, Add(StringLength(raw), 1))
+    }
+}
+
+Function.OpenAI.GetReasoning {
+    Output: Address
+    Body: { ReturnValue(OAIState.reasoning_buf) }
+}
+
+Function.OpenAI.GetResponseText {
+    Output: Address
+    Body: { ReturnValue(OAIState.text_buf) }
+}
+
+// Sanitize a string to valid UTF-8 by replacing invalid byte sequences with '?'.
+// APIs reject JSON with lone surrogates or stray continuation bytes.
+Function.OpenAI_SanitizeUTF8 {
+    Input: src: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(src)
+        out = Allocate(Add(n, 1))
+        ri = 0
+        wi = 0
+        WhileLoop LessThan(ri, n) {
+            b = GetByte(src, ri)
+            IfCondition LessThan(b, 128) ThenBlock: {
+                SetByte(out, wi, b)
+                wi = Add(wi, 1)
+                ri = Add(ri, 1)
+            } ElseBlock: {
+                IfCondition And(GreaterEqual(b, 194), LessEqual(b, 223)) ThenBlock: {
+                    ri1 = Add(ri, 1)
+                    IfCondition LessThan(ri1, n) ThenBlock: {
+                        b1 = GetByte(src, ri1)
+                        IfCondition And(GreaterEqual(b1, 128), LessEqual(b1, 191)) ThenBlock: {
+                            SetByte(out, wi, b)   wi = Add(wi, 1)
+                            SetByte(out, wi, b1)  wi = Add(wi, 1)
+                            ri = Add(ri, 2)
+                        } ElseBlock: {
+                            SetByte(out, wi, 63)  wi = Add(wi, 1)
+                            ri = Add(ri, 1)
+                        }
+                    } ElseBlock: {
+                        SetByte(out, wi, 63)  wi = Add(wi, 1)
+                        ri = Add(ri, 1)
+                    }
+                } ElseBlock: {
+                    IfCondition And(GreaterEqual(b, 224), LessEqual(b, 239)) ThenBlock: {
+                        ri1 = Add(ri, 1)
+                        ri2 = Add(ri, 2)
+                        IfCondition And(LessThan(ri1, n), LessThan(ri2, n)) ThenBlock: {
+                            b1 = GetByte(src, ri1)
+                            b2 = GetByte(src, ri2)
+                            v1 = And(GreaterEqual(b1, 128), LessEqual(b1, 191))
+                            v2 = And(GreaterEqual(b2, 128), LessEqual(b2, 191))
+                            // ED A0..BF is U+D800-DFFF (surrogates) — invalid in UTF-8.
+                            // E0 80..9F is overlong. APIs reject both as bad code points.
+                            surr = 0
+                            IfCondition And(EqualTo(b, 237), GreaterThan(b1, 159)) ThenBlock: { surr = 1 }
+                            IfCondition And(EqualTo(b, 224), LessThan(b1, 160)) ThenBlock: { surr = 1 }
+                            IfCondition And(And(EqualTo(v1, 1), EqualTo(v2, 1)), EqualTo(surr, 0)) ThenBlock: {
+                                SetByte(out, wi, b)   wi = Add(wi, 1)
+                                SetByte(out, wi, b1)  wi = Add(wi, 1)
+                                SetByte(out, wi, b2)  wi = Add(wi, 1)
+                                ri = Add(ri, 3)
+                            } ElseBlock: {
+                                SetByte(out, wi, 63)  wi = Add(wi, 1)
+                                ri = Add(ri, 1)
+                            }
+                        } ElseBlock: {
+                            SetByte(out, wi, 63)  wi = Add(wi, 1)
+                            ri = Add(ri, 1)
+                        }
+                    } ElseBlock: {
+                        IfCondition And(GreaterEqual(b, 240), LessEqual(b, 244)) ThenBlock: {
+                            ri1 = Add(ri, 1)
+                            ri2 = Add(ri, 2)
+                            ri3 = Add(ri, 3)
+                            IfCondition And(And(LessThan(ri1, n), LessThan(ri2, n)), LessThan(ri3, n)) ThenBlock: {
+                                b1 = GetByte(src, ri1)
+                                b2 = GetByte(src, ri2)
+                                b3 = GetByte(src, ri3)
+                                v1 = And(GreaterEqual(b1, 128), LessEqual(b1, 191))
+                                v2 = And(GreaterEqual(b2, 128), LessEqual(b2, 191))
+                                v3 = And(GreaterEqual(b3, 128), LessEqual(b3, 191))
+                                IfCondition And(And(EqualTo(v1, 1), EqualTo(v2, 1)), EqualTo(v3, 1)) ThenBlock: {
+                                    SetByte(out, wi, b)   wi = Add(wi, 1)
+                                    SetByte(out, wi, b1)  wi = Add(wi, 1)
+                                    SetByte(out, wi, b2)  wi = Add(wi, 1)
+                                    SetByte(out, wi, b3)  wi = Add(wi, 1)
+                                    ri = Add(ri, 4)
+                                } ElseBlock: {
+                                    SetByte(out, wi, 63)  wi = Add(wi, 1)
+                                    ri = Add(ri, 1)
+                                }
+                            } ElseBlock: {
+                                SetByte(out, wi, 63)  wi = Add(wi, 1)
+                                ri = Add(ri, 1)
+                            }
+                        } ElseBlock: {
+                            // Stray continuation (0x80-0xBF), overlong (0xC0-0xC1), or out-of-range (0xF5-0xFF)
+                            SetByte(out, wi, 63)  wi = Add(wi, 1)
+                            ri = Add(ri, 1)
+                        }
+                    }
+                }
+            }
+        }
+        SetByte(out, wi, 0)
+        ReturnValue(out)
+    }
+}
+
+Function.OpenAI.AppendToolResultsToHistory {
+    Input: arr: Address
+    Body: {
+        len = JSON.ArrayLength(arr)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            res_tag = JSON.ArrayGet(arr, i)
+            res_obj = JSON.AsObject(res_tag)
+
+            tid     = JSON.GetString(res_obj, "tool_use_id")
+            content = JSON.GetString(res_obj, "content")
+
+            // tid points into the tool slot buffer — Reset() will zero it.
+            // Copy before storing in history. Sanitize content to valid UTF-8 so
+            // DeepSeek (and other strict parsers) don't reject the request body.
+            IfCondition NotEqual(tid, 0) ThenBlock: { tid = OpenAI_StrDup(tid) }
+            IfCondition NotEqual(content, 0) ThenBlock: {
+                clean = OpenAI_SanitizeUTF8(content)
+                content = clean
+            }
+
+            msg = JSON.NewObject()
+            role_s = OpenAI_StrDup("tool")
+            JSON.SetString(msg, "role", role_s)
+            JSON.SetString(msg, "tool_call_id", tid)
+            JSON.SetString(msg, "content", content)
+
+            History.AppendRaw(msg)
+
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.OpenAI.Reset {
+    Body: {
+        SetByte(OAIState.text_buf, 0, 0)
+        OAIState.text_used = 0
+        SetByte(OAIState.reasoning_buf, 0, 0)
+        OAIState.reasoning_used = 0
+        OAIState.rc_chunk_count = 0
+        OAIState.tool_count = 0
+        OAIState.has_tools_flag = 0
+        OAIState.has_stop_flag = 0
+
+        i = 0
+        WhileLoop LessThan(i, OAIConst.MAX_TOOLS) {
+            slot = Add(OAIState.tool_slots, Multiply(i, 32))
+            id_ptr = Dereference(Add(slot, 0))
+            name_ptr = Dereference(Add(slot, 8))
+            args_ptr = Dereference(Add(slot, 16))
+
+            SetByte(id_ptr, 0, 0)
+            SetByte(name_ptr, 0, 0)
+            SetByte(args_ptr, 0, 0)
+            StoreValue(Add(slot, 24), 0)
+
+            i = Add(i, 1)
+        }
+    }
+}
