@@ -85,6 +85,10 @@ FixedPool.CCRunState {
     "log_open":      Initialize=0, CanChange=True  // 1 when log_fd is valid
     "log_bytes":     Initialize=0, CanChange=True  // bytes written this session
     "line_buf":      Initialize=0, CanChange=True  // persistent 1MB SSE line buffer (reuse, no per-turn alloc)
+    "ui_proj":       Initialize=0, CanChange=True
+    "ui_thread":     Initialize=0, CanChange=True
+    "ui_state":      Initialize=0, CanChange=True
+    "fresh":         Initialize=0, CanChange=True
 }
 
 // MCP on-demand tool table — stores manifest entries for spawn-per-call dispatch.
@@ -439,12 +443,24 @@ Function.CC_SessionLogUser {
 // Write COT + response sections to the session log (call before Backend.Reset).
 Function.CC_SessionLogResponse {
     Body: {
+        CC_AgentLog("[think] SessionLogResponse enter")
         ts = SystemCall(CCSys.SYS_TIME, 0, 0, 0, 0, 0)
         ts_str = NumberToString(ts)
         cot = Backend.GetReasoning()
+        CC_AgentLog("[think] GetReasoning ptr")
         resp = Backend.GetResponseText()
+        CC_AgentLog("[think] GetResponseText ptr")
+        cot_n = 0
+        IfCondition NotEqual(cot, 0) ThenBlock: { cot_n = StringLength(cot) }
+        CC_AgentLog(StringConcat("[think] cot chars=", NumberToString(cot_n)))
+        IfCondition GreaterThan(cot_n, 0) ThenBlock: {
+            CC_AgentLog("[think] write think.tmp")
+            CC_WriteAppFile("/tmp/halcode_app/think.tmp", cot)
+            SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/think.tmp", "/tmp/halcode_app/think.txt", 0, 0, 0)
+            CC_AgentLog("[think] wrote think.txt")
+        }
         IfCondition NotEqual(cot, 0) ThenBlock: {
-            IfCondition GreaterThan(StringLength(cot), 0) ThenBlock: {
+            IfCondition GreaterThan(cot_n, 0) ThenBlock: {
                 think_hdr = StringConcat("[THINKING ts=", ts_str)
                 think_hdr = StringConcat(think_hdr, "]\n")
                 CC_SessionLog(think_hdr, cot)
@@ -1181,7 +1197,9 @@ Function.CC_PrintMemoryReport {
 }
 
 Function.CC_RunTurn {
+    Output: Integer
     Body: {
+        request_ok = 0
         rss_turn_start = CC_GetProcessRSS_MB()
         m_start_msg = StringConcat("Start of turn. Process RSS: ", NumberToString(rss_turn_start))
         m_start_msg = StringConcat(m_start_msg, " MB\n")
@@ -1338,6 +1356,7 @@ Function.CC_RunTurn {
             }
             line_buf = CCRunState.line_buf
             CC_DebugLog("Starting API stream read. See /tmp/hal_turn.log for raw line data.\n")
+            CC_AgentLog("[worker] API stream start")
 
             stream_done = 0
             line_count = 0
@@ -1377,8 +1396,12 @@ Function.CC_RunTurn {
                 }
                     line_count = Add(line_count, 1)
                 IfCondition LessThan(line_len, 0) ThenBlock: {
+                    CC_AgentLog(StringConcat("[worker] stream readline len=", NumberToString(line_len)))
                     stream_done = 1
                 } ElseBlock: {
+                    IfCondition EqualTo(line_count, 1) ThenBlock: {
+                        CC_AgentLog(StringConcat("[worker] stream first line len=", NumberToString(line_len)))
+                    }
                     // Catch raw JSON errors (429 Rate Limit, 400 Bad Request) that aren't SSE
                     first_b = GetByte(line_buf, 0)
                     is_err_fmt = 0
@@ -1457,6 +1480,7 @@ Function.CC_RunTurn {
             // Check for mid-stream drop
             IfCondition And(EqualTo(clean_stop, 0), EqualTo(is_api_error, 0)) ThenBlock: {
                 CC_DebugLog("API stream DROPPED without clean stop.\n")
+                CC_AgentLog("[worker] API stream DROPPED without clean stop")
                 UI.ChatTag("✗", "API connection dropped mid-stream (Overload / Timeout)", 1)
                 UI.SetState(0)
                 is_api_error = 1
@@ -1481,6 +1505,7 @@ Function.CC_RunTurn {
             } ElseBlock: {
                 request_ok = 1
                 CC_DebugLog("Request OK.\n")
+                CC_AgentLog("[worker] Request OK")
                 CC_LogStageMemory("AFTER_API_STREAM")
             }
 
@@ -1717,7 +1742,13 @@ Function.CC_RunTurn {
                     CC_SleepMs(1000)
                 } ElseBlock: {
                     CC_DebugLog("Request FAILED after retries. Turn aborted.\n")
+                    CC_AgentLog("[worker] Request FAILED after retries")
                     UI.ChatTag("✗", "Turn failed after retries. Results saved to /tmp/hal_turn_log.txt — try again and ask the model to write in smaller chunks (<=500 lines per Write call).", 1)
+                    fail_msg = "hal: API stream dropped — no tokens. Check model/key (see /tmp/halcode_app/agent.err).\n"
+                    CC_WriteAppFile("/tmp/halcode_app/think.tmp", fail_msg)
+                    SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/think.tmp", "/tmp/halcode_app/think.txt", 0, 0, 0)
+                    CC_WriteAppFile("/tmp/halcode_app/reply.tmp", fail_msg)
+                    SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/reply.tmp", "/tmp/halcode_app/reply.txt", 0, 0, 0)
                     Backend.Reset()
                 }
             }
@@ -1729,6 +1760,8 @@ Function.CC_RunTurn {
             m_end_msg = StringConcat(m_end_msg, " MB)\n")
             CC_DebugLog(m_end_msg)
         }
+        CC_AgentLog(StringConcat("[worker] CC_RunTurn return request_ok=", NumberToString(request_ok)))
+        ReturnValue(request_ok)
     }
 }
 
@@ -3239,6 +3272,7 @@ Function.CC_ChatLoop {
                     History.SetSessionID(guid)
                     History.SetTitle("New Session")
                     History.Clear()
+                    CC_ClearHotCache()
                     CC_SaveSessionToPgmem()
                     UI.ChatTag("✓", StringConcat("Started new session: ", guid), 2)
                 }
@@ -3291,6 +3325,7 @@ Function.CC_ChatLoop {
                 }
                 IfCondition EqualTo(StringCompare(line, "/clear"), 0) ThenBlock: {
                     History.Init()
+                    CC_ClearHotCache()
                     ChatLog_Rotate()
                     UI.Shutdown()
                     UI.Init()
@@ -3817,11 +3852,420 @@ Function.CC_SetupAgentProvider {
 
 // Connect to already-running tool sockets without launching new processes.
 // Used in headless mode where the parent HalCode9000.x already launched tools.
+// ConnectProxy fails fast when leftover --mcp has no AgentProxy — do not hang.
 Function.CC_RegisterToolsOnly {
     Body: {
         CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
         CCRunState.child_count = 0
-        IPCDispatch.ConnectProxy()
+        proxy_ok = IPCDispatch.ConnectProxy()
+        CC_AgentLog(StringConcat("[init] ConnectProxy=", NumberToString(proxy_ok)))
+        IfCondition EqualTo(proxy_ok, 0) ThenBlock: {
+            CC_AgentLog("[init] no AgentProxy — tools not attached")
+        }
+    }
+}
+
+Function.CC_PgmemPickupKey {
+    Input: key: Address
+    Output: Address
+    Body: {
+        args = JSON.NewObject()
+        JSON.SetString(args, "op", "pickup")
+        JSON.SetString(args, "key", key)
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        resp = IPCDispatch.Dispatch("Pgmem", args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+        IfCondition EqualTo(err, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(resp, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringLength(resp), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(resp)
+    }
+}
+
+Function.CC_SanitizeOneLine {
+    Input: src: Address
+    Input: maxn: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(src)
+        IfCondition GreaterThan(n, maxn) ThenBlock: { n = maxn }
+        out = Allocate(Add(n, 1))
+        i = 0
+        WhileLoop LessThan(i, n) {
+            c = GetByte(src, i)
+            IfCondition EqualTo(c, 10) ThenBlock: { c = 32 }
+            IfCondition EqualTo(c, 13) ThenBlock: { c = 32 }
+            SetByte(out, i, c)
+            i = Add(i, 1)
+        }
+        SetByte(out, n, 0)
+        ReturnValue(out)
+    }
+}
+
+Function.CC_WriteAppFile {
+    Input: path: Address
+    Input: data: Address
+    Body: {
+        IfCondition EqualTo(data, 0) ThenBlock: { data = "" }
+        fd = SystemCall(CCSys.SYS_OPEN, path, 577, 420, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_WRITE, fd, data, StringLength(data), 0, 0)
+            SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.CC_ReadAppFile {
+    Input: path: Address
+    Input: buf: Address
+    Input: maxlen: Integer
+    Output: Integer
+    Body: {
+        fd = SystemCall(CCSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        n = SystemCall(CCSys.SYS_READ, fd, buf, Subtract(maxlen, 1), 0, 0)
+        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            SetByte(buf, 0, 0)
+            ReturnValue(0)
+        }
+        WhileLoop And(GreaterThan(n, 0), Or(EqualTo(GetByte(buf, Subtract(n, 1)), 10), EqualTo(GetByte(buf, Subtract(n, 1)), 13))) {
+            n = Subtract(n, 1)
+        }
+        SetByte(buf, n, 0)
+        ReturnValue(n)
+    }
+}
+
+// Same keys the TUI pickups after BootScroll. Writes /tmp/halcode_app/pickup.txt
+// so the GTK desk can show project/thread/sessions with no TUI/GUI split.
+
+Function.CC_ReadPromptFile {
+    Input: path: Address
+    Output: Address
+    Body: {
+        buf = Allocate(65536)
+        n = CC_ReadAppFile(path, buf, 65536)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 65536)
+            ReturnValue(0)
+        }
+        ReturnValue(buf)
+    }
+}
+
+Function.CC_EnsureSystemPrompt {
+    Output: Address
+    Body: {
+        CC_MkdirP(CC_ExpandHome("~/.halcode"))
+        home_p = CC_ExpandHome("~/.halcode/system_prompt.txt")
+        got = CC_ReadPromptFile(home_p)
+        IfCondition NotEqual(got, 0) ThenBlock: { ReturnValue(got) }
+        got = CC_ReadPromptFile("config/system_prompt.txt")
+        IfCondition NotEqual(got, 0) ThenBlock: {
+            CC_WriteAppFile(home_p, got)
+            ReturnValue(got)
+        }
+        ReturnValue("You are HAL Code 9000.")
+    }
+}
+
+Function.CC_LoadHalcodeConfig {
+    Body: {
+        pth = CC_ExpandHome("~/.halcode/halcode.json")
+        buf = Allocate(4096)
+        n = CC_ReadAppFile(pth, buf, 4096)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 4096)
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(ParseJSON(buf))
+        Deallocate(buf, 4096)
+        IfCondition EqualTo(obj, 0) ThenBlock: { ReturnValue(0) }
+        mt = JSON.GetNumber(obj, "max_tokens")
+        IfCondition GreaterThan(mt, 0) ThenBlock: {
+            Backend.SetMaxTokens(mt)
+        }
+    }
+}
+
+Function.CC_WritePickupSnapshot {
+    Body: {
+        SystemCall(CCSys.SYS_MKDIR, "/tmp/halcode_app", 493, 0, 0, 0)
+        out = ""
+        proj = CCRunState.ui_proj
+        thread = CCRunState.ui_thread
+        state = CCRunState.ui_state
+        IfCondition EqualTo(proj, 0) ThenBlock: { proj = "" }
+        IfCondition EqualTo(thread, 0) ThenBlock: { thread = "" }
+        IfCondition EqualTo(state, 0) ThenBlock: { state = "" }
+        p1 = CC_SanitizeOneLine(proj, 60)
+        p2 = CC_SanitizeOneLine(thread, 60)
+        p3 = CC_SanitizeOneLine(state, 200)
+        IfCondition EqualTo(p1, 0) ThenBlock: { p1 = "" }
+        IfCondition EqualTo(p2, 0) ThenBlock: { p2 = "" }
+        IfCondition EqualTo(p3, 0) ThenBlock: { p3 = "" }
+        out = StringConcat(out, "P ")
+        out = StringConcat(out, p1)
+        out = StringConcat(out, "\nT ")
+        out = StringConcat(out, p2)
+        out = StringConcat(out, "\nW ")
+        out = StringConcat(out, p3)
+        out = StringConcat(out, "\n")
+
+        s_args = JSON.NewObject()
+        JSON.SetString(s_args, "op", "search")
+        JSON.SetString(s_args, "query", "session:")
+        JSON.SetString(s_args, "kind", "session_meta")
+        JSON.SetString(s_args, "scope", "persistent")
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        resp = IPCDispatch.Dispatch("Pgmem", s_args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+        IfCondition EqualTo(err, 1) ThenBlock: {
+            out = StringConcat(out, "E pgmem not attached\n")
+        }
+        IfCondition And(EqualTo(err, 0), NotEqual(resp, 0)) ThenBlock: {
+            parsed = JSON.AsObject(ParseJSON(resp))
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                rows = JSON.GetArray(parsed, "rows")
+                IfCondition NotEqual(rows, 0) ThenBlock: {
+                    n_rows = JSON.ArrayLength(rows)
+                    written = 0
+                    i = 0
+                    last_sid = ""
+                    WhileLoop And(LessThan(i, n_rows), LessThan(written, 8)) {
+                        row_tag = JSON.ArrayGet(rows, i)
+                        row = JSON.AsObject(row_tag)
+                        IfCondition NotEqual(row, 0) ThenBlock: {
+                            key = JSON.GetString(row, "key")
+                            is_meta = 0
+                            IfCondition NotEqual(key, 0) ThenBlock: {
+                                klen = StringLength(key)
+                                IfCondition GreaterThan(klen, 5) ThenBlock: {
+                                    sub_pos = Subtract(klen, 5)
+                                    IfCondition EqualTo(StringCompare(Add(key, sub_pos), ":meta"), 0) ThenBlock: {
+                                        is_meta = 1
+                                    }
+                                }
+                            }
+                            IfCondition EqualTo(is_meta, 1) ThenBlock: {
+                                content_str = JSON.GetString(row, "content")
+                                IfCondition NotEqual(content_str, 0) ThenBlock: {
+                                    m_obj = JSON.AsObject(ParseJSON(content_str))
+                                    IfCondition NotEqual(m_obj, 0) ThenBlock: {
+                                        sid = JSON.GetString(m_obj, "id")
+                                        title = JSON.GetString(m_obj, "title")
+                                        IfCondition EqualTo(sid, 0) ThenBlock: { sid = "" }
+                                        IfCondition EqualTo(title, 0) ThenBlock: { title = "Untitled" }
+                                        sid_s = CC_SanitizeOneLine(sid, 40)
+                                        tit_s = CC_SanitizeOneLine(title, 36)
+                                        IfCondition EqualTo(sid_s, 0) ThenBlock: { sid_s = "" }
+                                        IfCondition EqualTo(tit_s, 0) ThenBlock: { tit_s = "Untitled" }
+                                        dup = 0
+                                        IfCondition GreaterThan(StringLength(last_sid), 0) ThenBlock: {
+                                            IfCondition EqualTo(StringCompare(sid_s, last_sid), 0) ThenBlock: { dup = 1 }
+                                        }
+                                        IfCondition EqualTo(dup, 0) ThenBlock: {
+                                            out = StringConcat(out, "S ")
+                                            out = StringConcat(out, sid_s)
+                                            out = StringConcat(out, " ")
+                                            out = StringConcat(out, tit_s)
+                                            out = StringConcat(out, "\n")
+                                            last_sid = sid_s
+                                            written = Add(written, 1)
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        i = Add(i, 1)
+                    }
+                }
+            }
+        }
+        CC_WriteAppFile("/tmp/halcode_app/pickup.tmp", out)
+        SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/pickup.tmp", "/tmp/halcode_app/pickup.txt", 0, 0, 0)
+    }
+}
+
+Function.CC_RestorePgmemUi {
+    Input: apply_ui: Integer
+    Body: {
+        CCRunState.ui_proj = 0
+        CCRunState.ui_thread = 0
+        CCRunState.ui_state = 0
+        proj = CC_PgmemPickupKey("ui.proj_slug")
+        thread = CC_PgmemPickupKey("ui.thread_slug")
+        state = CC_PgmemPickupKey("working_state")
+        IfCondition And(NotEqual(proj, 0), GreaterThan(StringLength(proj), 0)) ThenBlock: {
+            CCRunState.ui_proj = proj
+        }
+        IfCondition And(NotEqual(thread, 0), GreaterThan(StringLength(thread), 0)) ThenBlock: {
+            CCRunState.ui_thread = thread
+        }
+        IfCondition And(NotEqual(state, 0), GreaterThan(StringLength(state), 0)) ThenBlock: {
+            CCRunState.ui_state = state
+        }
+        IfCondition EqualTo(apply_ui, 1) ThenBlock: {
+            IfCondition NotEqual(CCRunState.ui_proj, 0) ThenBlock: {
+                UI.SetProjectThread(CCRunState.ui_proj, CCRunState.ui_thread)
+            }
+        }
+    }
+}
+
+// Wipe the persistent "where we were" cache so a NEW chat cannot recap the last thread.
+Function.CC_ClearHotCache {
+    Body: {
+        CCRunState.ui_state = 0
+        CCRunState.fresh = 1
+        args = JSON.NewObject()
+        JSON.SetString(args, "op", "park")
+        JSON.SetString(args, "key", "working_state")
+        JSON.SetString(args, "kind", "note")
+        JSON.SetString(args, "scope", "persistent")
+        JSON.SetString(args, "content", "NEW_SESSION. No prior task. Do not recap parked state. Answer only the current user message.")
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        IPCDispatch.Dispatch("Pgmem", args, 0, perr)
+        Deallocate(perr, 8)
+    }
+}
+
+Function.CC_MarkNoPickup {
+    Input: sid: Address
+    Body: {
+        CCRunState.fresh = 1
+        IfCondition NotEqual(sid, 0) ThenBlock: {
+            CC_WriteAppFile("/tmp/halcode_app/nopickup.txt", sid)
+        }
+    }
+}
+
+Function.CC_SessionIsFresh {
+    Input: sid: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sid, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(128)
+        n = CC_ReadAppFile("/tmp/halcode_app/nopickup.txt", buf, 128)
+        IfCondition And(GreaterThan(n, 0), EqualTo(StringCompare(buf, sid), 0)) ThenBlock: {
+            Deallocate(buf, 128)
+            ReturnValue(1)
+        }
+        Deallocate(buf, 128)
+        ReturnValue(0)
+    }
+}
+
+// GUI --agent is a new process each turn. Resume the same pgmem session the
+// TUI would: session.txt "new" starts clean, a sess-* id loads, else last.
+Function.CC_GuiApplySession {
+    Output: Integer
+    Body: {
+        CCRunState.fresh = 0
+        buf = Allocate(128)
+        n = CC_ReadAppFile("/tmp/halcode_app/session.txt", buf, 128)
+        is_last = 0
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(buf, "last"), 0) ThenBlock: { is_last = 1 }
+        }
+        IfCondition EqualTo(is_last, 1) ThenBlock: {
+            SystemCall(87, "/tmp/halcode_app/nopickup.txt", 0, 0, 0, 0)
+            n = 0
+        }
+        IfCondition And(GreaterThan(n, 0), EqualTo(StringCompare(buf, "new"), 0)) ThenBlock: {
+            guid = CC_GenerateSessionGUID()
+            History.Clear()
+            History.SetSessionID(guid)
+            History.SetTitle("New Session")
+            CC_ClearHotCache()
+            CC_MarkNoPickup(guid)
+            CC_SaveSessionToPgmem()
+            CC_WriteAppFile("/tmp/halcode_app/session.txt", guid)
+            Deallocate(buf, 128)
+            ReturnValue(0)
+        }
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            ok = CC_LoadSessionFromPgmem(buf)
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                IfCondition EqualTo(CC_SessionIsFresh(buf), 1) ThenBlock: {
+                    CCRunState.fresh = 1
+                }
+                Deallocate(buf, 128)
+                ReturnValue(1)
+            }
+        }
+        Deallocate(buf, 128)
+        loaded = CC_ResumeLastSession()
+        IfCondition EqualTo(loaded, 0) ThenBlock: {
+            guid2 = CC_GenerateSessionGUID()
+            History.SetSessionID(guid2)
+            History.SetTitle("New Session")
+            CC_ClearHotCache()
+            CC_MarkNoPickup(guid2)
+            CC_WriteAppFile("/tmp/halcode_app/session.txt", guid2)
+            ReturnValue(0)
+        }
+        sid = History.GetSessionID()
+        IfCondition NotEqual(sid, 0) ThenBlock: {
+            CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
+            IfCondition EqualTo(CC_SessionIsFresh(sid), 1) ThenBlock: {
+                CCRunState.fresh = 1
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+// Persistent tool parent for the GTK desk. Same BootTools + AgentProxy as TUI.
+// Does not KillStaleTools — leftover --mcp on-demand workers stay alone.
+Function.CC_RunHostMode {
+    Body: {
+        CC_ChdirToBinDir()
+        SystemCall(CCSys.SYS_MKDIR, "/tmp/halcode_app", 493, 0, 0, 0)
+        CC_WriteStdout("[host] begin\n")
+        History.Init()
+        IPCDispatch.Init()
+        CC_WriteStdout("[host] KillStaleTools\n")
+        CC_KillStaleTools()
+        CC_WriteStdout("[host] BootTools\n")
+        CC_BootTools()
+        CC_WriteStdout("[host] StartProxy\n")
+        IPCDispatch.StartProxy()
+        CC_WriteAppFile("/tmp/halcode_app/ready.txt", "1")
+        CC_WriteStdout("[host] ready.txt\n")
+        CC_RestorePgmemUi(0)
+        CC_WritePickupSnapshot()
+        CC_WriteStdout("[host] pgmem pickup written\n")
+        ts = Allocate(16)
+        WhileLoop 1 {
+            IPCDispatch.PollProxy()
+            i = 0
+            WhileLoop LessThan(i, CCRunState.child_count) {
+                slot = Multiply(i, 8)
+                pid = Dereference(Add(CCRunState.child_pids, slot))
+                IfCondition GreaterThan(pid, 0) ThenBlock: {
+                    wstat = Allocate(8)
+                    StoreValue(wstat, 0)
+                    wr = SystemCall(CCSys.SYS_WAIT4, pid, wstat, 1, 0, 0)
+                    Deallocate(wstat, 8)
+                    IfCondition GreaterThan(wr, 0) ThenBlock: {
+                        StoreValue(Add(CCRunState.child_pids, slot), 0)
+                    }
+                }
+                i = Add(i, 1)
+            }
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 16000000)
+            SystemCall(CCSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        }
     }
 }
 
@@ -3860,7 +4304,26 @@ Function.CC_RunAgentMode {
         CC_AgentLog("[worker] UI.Init")
         UI.Init()
         CC_AgentLog("[worker] appending prompt to history")
-        History.AppendUser(prompt)
+        user_prompt = prompt
+        IfCondition And(EqualTo(CCRunState.fresh, 0), NotEqual(CCRunState.ui_state, 0)) ThenBlock: {
+            skip_ws = 0
+            IfCondition GreaterThan(StringLength(CCRunState.ui_state), 11) ThenBlock: {
+                pfx = Allocate(13)
+                pi = 0
+                WhileLoop LessThan(pi, 12) {
+                    SetByte(pfx, pi, GetByte(CCRunState.ui_state, pi))
+                    pi = Add(pi, 1)
+                }
+                SetByte(pfx, 12, 0)
+                IfCondition EqualTo(StringCompare(pfx, "NEW_SESSION."), 0) ThenBlock: { skip_ws = 1 }
+                Deallocate(pfx, 13)
+            }
+            IfCondition EqualTo(skip_ws, 0) ThenBlock: {
+                head = StringConcat(CCRunState.ui_state, "\n")
+                user_prompt = StringConcat(head, prompt)
+            }
+        }
+        History.AppendUser(user_prompt)
 
         CC_AgentLog("[worker] CCFan init")
         fan_ok = CCFan_Init()
@@ -3880,8 +4343,12 @@ Function.CC_RunAgentMode {
         WhileLoop And(EqualTo(agent_keep_going, 1), LessThan(agent_turn, agent_max_turns)) {
             agent_keep_going = 0
             CC_AgentLog(StringConcat("[worker] CC_RunTurn turn=", NumberToString(agent_turn)))
-            CC_RunTurn()
-            CC_AgentLog("[worker] CC_RunTurn complete")
+            turn_ok = CC_RunTurn()
+            CC_AgentLog(StringConcat("[worker] CC_RunTurn complete ok=", NumberToString(turn_ok)))
+            IfCondition EqualTo(turn_ok, 0) ThenBlock: {
+                CC_AgentLog("[worker] turn failed — not looping 25 empty retries")
+                agent_keep_going = 0
+            }
 
             // Tool results are appended as role:"user" messages by
             // Backend.AppendToolResultsToHistory. If the last history entry
@@ -3942,8 +4409,22 @@ Function.CC_RunAgentMode {
         }
 
         CC_AgentLog(StringConcat("[worker] result chars=", NumberToString(StringLength(result))))
+        IfCondition EqualTo(result, 0) ThenBlock: { result = "" }
+        IfCondition EqualTo(Backend.HitLength(), 1) ThenBlock: {
+            CC_AgentLog("[worker] finish_reason=length")
+            result = StringConcat(result, "\n\n[reply truncated: hit max_tokens — raise max_tokens in ~/.halcode/halcode.json]")
+        }
+        CC_WriteAppFile("/tmp/halcode_app/reply.tmp", result)
+        SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/reply.tmp", "/tmp/halcode_app/reply.txt", 0, 0, 0)
+        CC_AgentLog("[worker] wrote reply.txt")
+        CC_AgentLog("[worker] think dump was during CC_SessionLogResponse (before Reset)")
         CC_WriteStdout(result)
         CC_WriteStdout("\n")
+        CC_SaveSessionToPgmem()
+        sid_out = History.GetSessionID()
+        IfCondition NotEqual(sid_out, 0) ThenBlock: {
+            CC_WriteAppFile("/tmp/halcode_app/session.txt", sid_out)
+        }
         CC_AgentLog("[worker] done")
     }
 }
@@ -4649,7 +5130,7 @@ SubRoutine.Main {
         History.Init()
         IPCDispatch.Init()
         cred = CC_SetupAgentProvider("deepseek")
-        CCConst.SYSTEM_PROMPT = "You are HAL Code 9000. Be concise."
+        CCConst.SYSTEM_PROMPT = CC_EnsureSystemPrompt()
         Backend.Init("apikey", cred, CCConst.SYSTEM_PROMPT)
         // Respond to initialize immediately so health checks pass before schema boot.
         mcp_init_buf = Allocate(16384)
@@ -4674,11 +5155,35 @@ SubRoutine.Main {
         SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
     }
 
+    // GUI tool parent: ./HalCode9000.x --host
+    // Boots cc_tools + AgentProxy like the TUI, pickups pgmem, stays up.
+    host_flag = CC_HasArg("--host")
+    IfCondition EqualTo(host_flag, 1) ThenBlock: {
+        host_sigact = Allocate(32)
+        StoreValue(Add(host_sigact, 0), 0)
+        StoreValue(Add(host_sigact, 8), 0)
+        StoreValue(Add(host_sigact, 16), 0)
+        StoreValue(Add(host_sigact, 24), 0)
+        SystemCall(13, 2, host_sigact, 0, 8, 0)
+        SystemCall(13, 15, host_sigact, 0, 8, 0)
+        Deallocate(host_sigact, 32)
+        CC_RunHostMode()
+        SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+    }
+
     // Headless agent mode: ./HalCode9000.x --agent <provider>[:<model>]
     // Must be detected before the splash so nothing writes to stdout.
     agent_spec = CC_ReadArgValue("--agent")
     IfCondition NotEqual(agent_spec, 0) ThenBlock: {
-        CC_AgentLog("[init] agent mode detected")
+        ag_sig = Allocate(32)
+        StoreValue(Add(ag_sig, 0), 0)
+        StoreValue(Add(ag_sig, 8), 0)
+        StoreValue(Add(ag_sig, 16), 0)
+        StoreValue(Add(ag_sig, 24), 0)
+        SystemCall(13, 2, ag_sig, 0, 8, 0)
+        SystemCall(13, 15, ag_sig, 0, 8, 0)
+        Deallocate(ag_sig, 32)
+        CC_AgentLog("[init] agent mode detected SIGTERM=DFL")
         prompt_buf = Allocate(CCConst.INPUT_BUF_SZ)
         CC_AgentLog("[init] reading stdin")
         n_read = CC_ReadStdinAll(prompt_buf, CCConst.INPUT_BUF_SZ)
@@ -4690,15 +5195,20 @@ SubRoutine.Main {
         CC_AgentLog("[init] CC_SetupAgentProvider")
         cred = CC_SetupAgentProvider(agent_spec)
         CC_AgentLog("[init] SYSTEM_PROMPT assign")
-        CCConst.SYSTEM_PROMPT = "You are HAL Code 9000, a headless tool-using agent. FUNCTION CALLS ONLY: Tools are registered via the function call API. Invoke them using function calls — NEVER describe actions in text and NEVER write XML or angle-bracket tool syntax like <read><path>...</path></read>. Call the function directly and wait for the result. WSL2 RULES: (1) NEVER use find with / or /mnt or Windows paths. (2) Use Relmem op=symbols to locate files. (3) Scope find to specific subdirectories. (4) Pipe unbounded output through head/grep/tail. (5) NEVER call Relmem op=index on broad paths. (6) Use Pgmem op=\"search\" to discover parked data; use op=\"pickup\" only for exact known keys (e.g. working_state, project_map). (7) Max 25 tool chains in a row, then ask user. (8) BLOCKED COMMANDS: sudo, rm, mv, dd, kill, killall, pkill, crontab, and piping to sh/bash are all forbidden. (9) AILang: run `./ailang.x src.ailang dest.x` and `./analyzer.x src.ailang` via Bash to check syntax. (10) VCS: use Olympus tool (snapshot, review, log, info, init) for compound workflows; use Git tool for raw git subcommands. (11) Write tool: use absolute paths. If grandparent missing, use Bash mkdir -p. For files >200 lines, use Bash `cat << 'EOF' > file`. (12) Write tool blocks /etc, /proc, /sys, /dev, /bin, /usr. (13) NO UNSOLICITED EDITS: never modify files unless explicitly asked — read-only exploration (Read, Head, Grep, Find, Stat, Wc, Du, Diff, LS, Git) is always OK without asking. (14) TOOL ERRORS: recheck your own parameters first — most errors are bad inputs not broken tools; retry with corrected params before reporting the tool as broken. (15) GREP: when path is a directory you MUST pass recursive=1; the include glob (e.g. *.ailang) only applies in recursive mode. (16) AGENT: always pass task_id (use the pgmem task ID from op=task_create) so the daemon can call task_end and mark the task complete; omitting task_id leaves the task stuck in pending forever. (17) AGENT WAITING: after spawning agents call `Sleep seconds=90` (the Sleep tool) then check Pgmem ONCE per wait cycle — NEVER use Bash sleep or poll Pgmem in a loop; the Sleep tool is the ONLY safe wait mechanism because it does not touch Pgmem; Pgmem is single-threaded and each pickup call holds the socket, blocking the agent daemon from parking its result and calling task_end, which causes a deadlock that kills the agent with a timeout. (18) SKILLS: at session start call `Skills op=list` to see available skill sheets, then load relevant ones with `Skills op=read name=<skill>` — each sheet gives focused instructions for a specific task domain. Load before starting work, not after getting stuck. (19) EDIT vs WRITE: for existing files always prefer Edit (exact string replace, sends only the diff) over Write (overwrites whole file); use Write only for new files or complete rewrites. (20) PGMEM HOT CACHE: after any turn where you used a tool or reached a decision, call Pgmem op=park scope=persistent key=working_state content=\"<current task | key files touched | decisions made | next step — max 400 chars>\". At session start, call Pgmem op=pickup key=working_state to orient yourself before doing anything. (21) PROJECT MAP: maintain a compact project directory in Pgmem — call Pgmem op=park scope=persistent key=project_map content=\"<active dirs, key files and what they do — max 600 chars>\" whenever you discover new structure or files. (22) SESSION LOG: every conversation is saved in full (user messages, thinking, responses, all tool calls and results) to ~/.halcode/logs/session_<timestamp>.txt. On crash or resume request, use the Read tool on the most recent file in that directory to reconstruct full context. (23) CONTEXT PRESSURE: when input_tokens exceeds ~115000 (65% of 180K window), park a curated checkpoint: call Pgmem op=park scope=persistent key=chat:<proj>:<thread>:checkpoint:<N> content=\"<key decisions, files modified, current task, critical state, next step — max 1200 chars>\". Increment N from the previous checkpoint number (start at 1 if none). Then tell the user: 'Context at N% — checkpoint parked.' Do this once when crossing the threshold, not on every turn. (24) PROJECT THREAD MEMORY: use key prefix chat:<proj>:<thread>: for project-specific state (e.g. chat:halcode/ui-work:turn:7). Active project and thread are set with /project <name> and /thread <name> — they appear in the rule row. To read active context: Pgmem op=pickup key=ui.proj_slug and key=ui.thread_slug. For important turn results: retrieve the seq counter via op=pickup key=chat:<proj>:<thread>:__seq__, increment it, park back as the same key, then park the turn content at key=chat:<proj>:<thread>:turn:<N>."
+        CCConst.SYSTEM_PROMPT = CC_EnsureSystemPrompt()
         CC_AgentLog("[init] History.Init")
         History.Init()
         CC_AgentLog("[init] IPCDispatch.Init")
         IPCDispatch.Init()
         CC_AgentLog("[init] Backend.Init")
         Backend.Init("apikey", cred, CCConst.SYSTEM_PROMPT)
+        CC_LoadHalcodeConfig()
         CC_AgentLog("[init] CC_RegisterToolsOnly")
         CC_RegisterToolsOnly()
+        CC_AgentLog("[init] CC_RestorePgmemUi")
+        CC_RestorePgmemUi(0)
+        CC_AgentLog("[init] CC_GuiApplySession")
+        CC_GuiApplySession()
         CC_AgentLog("[init] CC_RunAgentMode")
         CC_RunAgentMode(prompt_buf)
         SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
@@ -4725,7 +5235,7 @@ SubRoutine.Main {
     // Tool registration logs print via PrintMessage; both happen before
     // we grab the screen.
 
-    CCConst.SYSTEM_PROMPT = "You are HAL Code 9000. Be concise. WSL2 RULES: (1) NEVER use find with / or /mnt or Windows paths. (2) Use Relmem op=symbols to locate files. (3) Scope find to specific subdirectories. (4) Pipe unbounded output through head/grep/tail. (5) NEVER call Relmem op=index on broad paths. (6) Use Pgmem op=\"search\" to discover parked data; use op=\"pickup\" only for exact known keys (e.g. working_state, project_map). (7) Max 25 tool chains in a row, then ask user. (8) BLOCKED COMMANDS: sudo, rm, mv, dd, kill, killall, pkill, crontab, and piping to sh/bash are all forbidden. (9) AILang: run `./ailang.x src.ailang dest.x` and `./analyzer.x src.ailang` via Bash to check syntax. (10) VCS: use Olympus tool (snapshot, review, log, info, init) for compound workflows; use Git tool for raw git subcommands. (11) Write tool: use absolute paths. If grandparent missing, use Bash mkdir -p. For files >200 lines, use Bash `cat << 'EOF' > file`. (12) Write tool blocks /etc, /proc, /sys, /dev, /bin, /usr. (13) NO UNSOLICITED EDITS: never modify files unless explicitly asked — read-only exploration (Read, Head, Grep, Find, Stat, Wc, Du, Diff, LS, Git) is always OK without asking. (14) TOOL ERRORS: recheck your own parameters first — most errors are bad inputs not broken tools; retry with corrected params before reporting the tool as broken. (15) GREP: when path is a directory you MUST pass recursive=1; the include glob (e.g. *.ailang) only applies in recursive mode. (16) AGENT: always pass task_id (use the pgmem task ID from op=task_create) so the daemon can call task_end and mark the task complete; omitting task_id leaves the task stuck in pending forever. (17) AGENT WAITING: after spawning agents call `Sleep seconds=90` (the Sleep tool) then check Pgmem ONCE per wait cycle — NEVER use Bash sleep or poll Pgmem in a loop; the Sleep tool is the ONLY safe wait mechanism because it does not touch Pgmem; Pgmem is single-threaded and each pickup call holds the socket, blocking the agent daemon from parking its result and calling task_end, which causes a deadlock that kills the agent with a timeout. (18) SKILLS: at session start call `Skills op=list` to see available skill sheets, then load relevant ones with `Skills op=read name=<skill>` — each sheet gives focused instructions for a specific task domain. Load before starting work, not after getting stuck. (19) EDIT vs WRITE: for existing files always prefer Edit (exact string replace, sends only the diff) over Write (overwrites whole file); use Write only for new files or complete rewrites. (20) PGMEM HOT CACHE: after any turn where you used a tool or reached a decision, call Pgmem op=park scope=persistent key=working_state content=\"<current task | key files touched | decisions made | next step — max 400 chars>\". At session start, call Pgmem op=pickup key=working_state to orient yourself before doing anything. (21) PROJECT MAP: maintain a compact project directory in Pgmem — call Pgmem op=park scope=persistent key=project_map content=\"<active dirs, key files and what they do — max 600 chars>\" whenever you discover new structure or files. (22) SESSION LOG: every conversation is saved in full (user messages, thinking, responses, all tool calls and results) to ~/.halcode/logs/session_<timestamp>.txt. On crash or resume request, use the Read tool on the most recent file in that directory to reconstruct full context. (23) CONTEXT PRESSURE: when input_tokens exceeds ~115000 (65% of 180K window), park a curated checkpoint: call Pgmem op=park scope=persistent key=chat:<proj>:<thread>:checkpoint:<N> content=\"<key decisions, files modified, current task, critical state, next step — max 1200 chars>\". Increment N from the previous checkpoint number (start at 1 if none). Then tell the user: 'Context at N% — checkpoint parked.' Do this once when crossing the threshold, not on every turn. (24) PROJECT THREAD MEMORY: use key prefix chat:<proj>:<thread>: for project-specific state (e.g. chat:halcode/ui-work:turn:7). Active project and thread are set with /project <name> and /thread <name> — they appear in the rule row. To read active context: Pgmem op=pickup key=ui.proj_slug and key=ui.thread_slug. For important turn results: retrieve the seq counter via op=pickup key=chat:<proj>:<thread>:__seq__, increment it, park back as the same key, then park the turn content at key=chat:<proj>:<thread>:turn:<N>."
+    CCConst.SYSTEM_PROMPT = CC_EnsureSystemPrompt()
 
     CC_ChdirToBinDir()
     CC_KillStaleTools()
@@ -4752,6 +5262,7 @@ SubRoutine.Main {
 
             CCConst.PROJ_PROMPT = CC_LoadProjectPrompt()
             Backend.Init(auth_mode_str, credential, CC_BuildFullPrompt())
+            CC_LoadHalcodeConfig()
 
             // Now grab the terminal — auth is done, no more cooked-mode prints.
             // Rotate previous session's chat log before opening a new one.
@@ -4766,34 +5277,8 @@ SubRoutine.Main {
 
             UI.BootScroll()
 
-            // Restore project/thread context from previous session via Pgmem
-            _rp_args = JSON.NewObject()
-            JSON.SetString(_rp_args, "op", "pickup")
-            JSON.SetString(_rp_args, "key", "ui.proj_slug")
-            _rp_perr = Allocate(8)
-            StoreValue(_rp_perr, 0, "dword")
-            _rp_resp = IPCDispatch.Dispatch("Pgmem", _rp_args, 0, _rp_perr)
-            _rp_err = Dereference(_rp_perr, "dword")
-            Deallocate(_rp_perr, 8)
-            _rt_args = JSON.NewObject()
-            JSON.SetString(_rt_args, "op", "pickup")
-            JSON.SetString(_rt_args, "key", "ui.thread_slug")
-            _rt_perr = Allocate(8)
-            StoreValue(_rt_perr, 0, "dword")
-            _rt_resp = IPCDispatch.Dispatch("Pgmem", _rt_args, 0, _rt_perr)
-            _rt_err = Dereference(_rt_perr, "dword")
-            Deallocate(_rt_perr, 8)
-            IfCondition EqualTo(_rp_err, 0) ThenBlock: {
-                IfCondition And(NotEqual(_rp_resp, 0), GreaterThan(StringLength(_rp_resp), 0)) ThenBlock: {
-                    _rt_val = 0
-                    IfCondition EqualTo(_rt_err, 0) ThenBlock: {
-                        IfCondition And(NotEqual(_rt_resp, 0), GreaterThan(StringLength(_rt_resp), 0)) ThenBlock: {
-                            _rt_val = _rt_resp
-                        }
-                    }
-                    UI.SetProjectThread(_rp_resp, _rt_val)
-                }
-            }
+            // Restore project/thread/working_state from Pgmem — same path as GUI.
+            CC_RestorePgmemUi(1)
 
             // Compact in-chat session header — small mascot + version/model/cwd
             UI.SessionHeader(0, 0, 0)

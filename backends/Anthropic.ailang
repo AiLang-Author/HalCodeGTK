@@ -57,7 +57,7 @@ FixedPool.AnthCfg {
     "auth_mode":          Initialize=0, CanChange=True   // "apikey" or "oauth"
     "model":              Initialize=0, CanChange=True
     "system_prompt":      Initialize=0, CanChange=True
-    "max_tokens":         Initialize=4096, CanChange=True
+    "max_tokens":         Initialize=8192, CanChange=True
 }
 
 FixedPool.AnthState {
@@ -123,6 +123,13 @@ Function.Anthropic.Init {
         MemorySet(AnthState.tool_ids, 0, 256)
         AnthState.tool_count = 0
         AnthState.initialized = 1
+    }
+}
+
+Function.Anthropic.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition GreaterThan(n, 0) ThenBlock: { AnthCfg.max_tokens = n }
     }
 }
 

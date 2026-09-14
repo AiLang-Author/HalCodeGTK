@@ -30,3 +30,13 @@ nohup.out
 # ── OS junk ──────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── Local GTK builds (compile on install) ────────────────────────────────────
+shell/halcode_shell_gtk
+shell/write_hello_frame
+
+# ── Dev screenshots / scratch ────────────────────────────────────────────────
+Screenshot*.png
+failed text boundry .png
+/tmp/
+debug.log

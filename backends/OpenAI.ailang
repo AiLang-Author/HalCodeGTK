@@ -53,6 +53,7 @@ FixedPool.OAIState {
     "tool_count":           Initialize=0, CanChange=True
     "has_tools_flag":       Initialize=0, CanChange=True
     "has_stop_flag":        Initialize=0, CanChange=True
+    "hit_len":              Initialize=0, CanChange=True
     "last_input_tokens":    Initialize=0, CanChange=True
     "last_output_tokens":   Initialize=0, CanChange=True
     "last_cache_hit":       Initialize=0, CanChange=True
@@ -116,6 +117,18 @@ Function.OpenAI.SetModel {
     Body: {
         OAICfg.model = model_name
     }
+}
+
+Function.OpenAI.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition GreaterThan(n, 0) ThenBlock: { OAICfg.max_tokens = n }
+    }
+}
+
+Function.OpenAI.HitLength {
+    Output: Integer
+    Body: { ReturnValue(OAIState.hit_len) }
 }
 
 Function.OpenAI.PrintUsage {
@@ -363,6 +376,10 @@ Function.OpenAI.OnEvent {
                     }
                     IfCondition Or(EqualTo(StringCompare(fr, "stop"), 0), EqualTo(StringCompare(fr, "STOP"), 0)) ThenBlock: {
                         OAIState.has_stop_flag = 1
+                    }
+                    IfCondition Or(EqualTo(StringCompare(fr, "length"), 0), EqualTo(StringCompare(fr, "LENGTH"), 0)) ThenBlock: {
+                        OAIState.has_stop_flag = 1
+                        OAIState.hit_len = 1
                     }
                 }
 
@@ -803,6 +820,7 @@ Function.OpenAI.Reset {
         OAIState.tool_count = 0
         OAIState.has_tools_flag = 0
         OAIState.has_stop_flag = 0
+        OAIState.hit_len = 0
 
         i = 0
         WhileLoop LessThan(i, OAIConst.MAX_TOOLS) {

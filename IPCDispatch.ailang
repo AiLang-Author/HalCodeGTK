@@ -224,16 +224,18 @@ Function.IPCDispatch.PollProxy {
 // Call instead of CC_RegisterToolsOnly in --agent mode.
 // =============================================================================
 Function.IPCDispatch.ConnectProxy {
+    Output: Integer
     Body: {
         fd = Socket.Create(1, 1)
         IfCondition LessThan(fd, 0) ThenBlock: {
             IPCD_Log("[proxy-agent] socket create failed\n")
             ReturnValue(0)
         }
-        // Retry for up to 5 seconds (parent may still be booting)
+        // Fail fast: GUI host / TUI parent should already be listening.
+        // 8 × 100ms — do not hang 5s when leftover --mcp has no AgentProxy.
         _att = 0
         _cr = -1
-        WhileLoop And(LessThan(_att, 50), LessThan(_cr, 0)) {
+        WhileLoop And(LessThan(_att, 8), LessThan(_cr, 0)) {
             _cr = Socket.ConnectUnix(fd, "@halcode/AgentProxy")
             IfCondition LessThan(_cr, 0) ThenBlock: {
                 Socket.Close(fd)

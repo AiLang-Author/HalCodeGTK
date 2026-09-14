@@ -105,6 +105,13 @@ Function.Gemini.SetModel {
     }
 }
 
+Function.Gemini.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition GreaterThan(n, 0) ThenBlock: { GEMINICfg.max_tokens = n }
+    }
+}
+
 Function.Gemini.PrintUsage {
     Body: {
         IfCondition GreaterThan(GEMINIState.last_input_tokens, 0) ThenBlock: {

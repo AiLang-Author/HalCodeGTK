@@ -113,6 +113,31 @@ Function.Backend.Init {
     }
 }
 
+Function.Backend.SetMaxTokens {
+    Input: n: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.ANTHROPIC) ThenBlock: {
+            Anthropic.SetMaxTokens(n)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(BackendState.kind, BackendKind.GEMINI) ThenBlock: {
+            Gemini.SetMaxTokens(n)
+            ReturnValue(0)
+        }
+        OpenAI.SetMaxTokens(n)
+    }
+}
+
+Function.Backend.HitLength {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(BackendState.kind, BackendKind.OPENAI) ThenBlock: {
+            ReturnValue(OpenAI.HitLength())
+        }
+        ReturnValue(0)
+    }
+}
+
 // =============================================================================
 // HEADERS
 // =============================================================================
