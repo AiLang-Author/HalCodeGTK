@@ -6,6 +6,8 @@ Pixels come from an AILang desk (`halcode_desk.x`) plus a thin GTK blit host.
 
 Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
 
+![HalCodeGTK](docs/screenshot.png)
+
 ## Requirements
 
 - Linux desktop (X11)
