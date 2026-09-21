@@ -1,34 +1,48 @@
-# HalBot — Web-API Agent for the Grok Bot VM
+# HalBot — Open-Ended Web-API Agent (any backend drives it)
 
-Status: **Draft v0.1** — design source of truth, code not yet written.
+Status: **Draft v0.2** — design source of truth; Phase 1 code in progress.
 Companion to: `HalCode9000.md`, `docs/architecture.md`, `docs/DESIGN_PGMEM.md`, `API.md`.
 
 ---
 
 ## 1. Decision
 
-Three directions were on the table for the Grok Bot integration:
+HalBot is **HalCode9000 running as a headless web-API agent** (`--serve` mode).
+It is not tied to any one hosted bot product. **Any API backend can provide the
+bot service** — a hosted bot (Grok, Claude, Cursor, ChatGPT, a custom skill), a
+script, a GTK shell, or a phone — by speaking the same `/v1/chat` SSE surface
+the desktop uses today.
 
-1. **Computer-use tool** — expose HalCode9000's tools as a single computer-use
-   call for the Grok Bot model (thin, but throws away the agent loop + memory).
-2. **Self-hosted always-on agent** — run the full HalCode9000 agent as a
-   persistent process in the Grok Bot VM, driven over an API.
-3. **Connector model** — register HalCode9000 as a Grok Bot "connector" and let
-   xAI's runtime own the loop.
+What actually differs between one "bot" and another is only two things:
 
-**Chosen: (2), with (3) as the integration surface.** HalBot is the full
-HalCode9000 agent running in the VM, exposed as a **web API** (`--serve` mode),
-so the Grok Bot (or any HTTP client) drives it the same way the desktop drives
-HalCodeGTK today. The Grok Bot side is wired up as a connector/skill that points
-at the VM-local endpoint.
+1. **Prompts** — the system/user prompt it is given (and, optionally, the
+   provider+model routed per request).
+2. **The local computer** — the machine HalBot is running on.
 
-> "API via web, like halcode for the bot" — HalBot is to the Grok Bot what
+HalBot **owns its own machine**: the VM it boots in. On that machine it can
+install packages, write and modify files, run builds, and generally
+self-modify — **locally to itself**, never on the host. That is the point: the
+bot has a disposable workspace it is free to change, and the agent loop's tools
+(Bash, Write, Edit, Ailang compile, Packager, Git, …) already target that VM's
+filesystem.
+
+> "API via web, like halcode for the bot" — HalBot is to any driver what
 > HalCode9000 is to the desktop: the same agent loop, tools, providers, and
 > memory, behind a network API instead of a TUI/GTK front end.
 
 **The shape of everything else is fine.** No rewrite of the agent loop, tool
 dispatch, providers, or memory. This spec only adds (a) an HTTP surface and
 (b) coordinator/worker task semantics on top of the existing sub-agent path.
+
+### Provider-agnostic from the start
+
+HalBot reuses the existing provider abstraction. `backends/Backend.ailang`
+dispatches by `SelectedProvider.kind` (Anthropic/OpenAI/Gemini), and
+`CC_SetupAgentProvider()` already maps a `provider[:model]` spec onto the
+matching key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `XAI_API_KEY`,
+`DEEPSEEK_API_KEY`, `GEMINI_API_KEY`, or a local endpoint). So the same
+`--serve` process can run behind any backend with no code change — the driver
+just supplies (or the config defaults) the provider/model.
 
 ---
 
@@ -37,10 +51,12 @@ dispatch, providers, or memory. This spec only adds (a) an HTTP surface and
 | Term | Meaning |
 |---|---|
 | **HalBot** | `HalCode9000.x` running in `--serve` mode (web API). |
+| **Driver** | Any HTTP client that talks to HalBot: hosted bot product, script, GTK shell, phone. |
 | **Coordinator** | The HalBot main loop: decomposes work, assigns tasks, collects results. |
 | **Worker** | A headless `HalCode9000.x --agent <provider>:<model>` child that runs one task and parks a result. |
 | **Task** | A discrete work unit with a lifecycle (create → assign → run → park → end). |
 | **Drive assignment** | See §5 — the semantics behind "coordinator/workers". |
+| **The bot's machine** | The VM HalBot boots in — its own filesystem, owned and mutable locally. |
 
 ---
 
@@ -48,14 +64,14 @@ dispatch, providers, or memory. This spec only adds (a) an HTTP surface and
 
 | HalBot concern | Existing component | Change |
 |---|---|---|
-| Agent loop (turn, tools, history) | `HalCode9000.ailang` `CC_RunTurn()` | none |
+| Agent loop (turn, tools, history) | `HalCode9000.ailang` `CC_RunTurn()` | none (reused via `--agent` child in Phase 1) |
 | Web API surface | **NEW** `--serve` mode (mirrors `--mcp`) | add |
 | Tool execution | `IPCDispatch.ailang` + 26 `cc_*_ipc.x` | none |
-| Model access | `backends/Backend.ailang` + `providers/*.json` | none (`xai.json` already present) |
+| Model access (any provider) | `backends/Backend.ailang` + `providers/*.json` + `CC_SetupAgentProvider()` | none |
 | Persistent memory | Pgmem (Postgres) + Relmem (symbolic graph) | none |
 | Sub-agent spawn | `cc_agent_ipc.x` (Agent tool) | small: provider/model from task routing |
 | Task records | Pgmem `op=task_*` + `hc_tasks` (`DESIGN_PGMEM.md`) | wire |
-| HTTP server | `Library.HTTPServer` (or `Library.Socket`) | add |
+| HTTP server | `Library.Socket` (raw syscalls) | add |
 | HTTP client (model API, callbacks) | `Library.HTTP` | none |
 
 HalBot compiles to the same binary; `--serve` is a fourth mode alongside
@@ -88,14 +104,14 @@ Transport: HTTP/1.1 + Server-Sent Events (SSE). Auth: `Authorization: Bearer <to
 
 ### Example — `POST /v1/chat`
 
-Request:
+Request (provider/model optional — HalBot defaults per config):
 
 ```json
 {
-  "message": "Review backends/Backend.ailang for the backend-kind dispatch bug",
+  "message": "Install ripgrep on this machine, then write a README noting it's done",
   "system_prompt": "optional override",
-  "provider": "xai",
-  "model": "grok-3",
+  "provider": "openai",
+  "model": "gpt-4o",
   "approval": "auto"
 }
 ```
@@ -104,19 +120,19 @@ Response (`Content-Type: text/event-stream`):
 
 ```
 event: session
-data: {"session_id":"sess_01J...","model":"grok-3"}
+data: {"session_id":"sess_01J...","model":"gpt-4o"}
 
 event: text_delta
-data: {"text":"I'll start by reading the file."}
+data: {"text":"I'll start by checking the package manager."}
 
 event: tool_call
-data: {"tool":"Read","id":"toolu_01...","args":{"path":"/home/bob/HalCodeGTK/backends/Backend.ailang"}}
+data: {"tool":"Bash","id":"toolu_01...","args":{"command":"apt-get install -y ripgrep"}}
 
 event: tool_result
-data: {"tool":"Read","id":"toolu_01...","ok":true,"truncated":false}
+data: {"tool":"Bash","id":"toolu_01...","ok":true,"truncated":false}
 
 event: task_assigned
-data: {"task_id":"t_17","title":"review backend-kind dispatch","assigned_to":"grok-3-mini","provider":"xai"}
+data: {"task_id":"t_17","title":"install ripgrep","assigned_to":"gpt-4o-mini","provider":"openai"}
 
 event: task_complete
 data: {"task_id":"t_17","result_key":"halbot:result:t_17","status":"complete"}
@@ -125,9 +141,17 @@ event: turn_done
 data: {"stop_reason":"end_turn"}
 ```
 
-The SSE emitter is a small new module (`Serve.ailang`); the inbound SSE parser
-(`Library.SSE`) is reused unchanged. The model stream inside the loop is already
-handled by `Backend.OnEvent`.
+The SSE emitter is a small new module (Phase 1 inlines it in `HalCode9000.ailang`);
+the inbound SSE parser (`Library.SSE`) is reused unchanged for model streams.
+The model stream inside the loop is already handled by `Backend.OnEvent`.
+
+### Phase 1 scope (current)
+
+- `--serve` boots tools + AgentProxy (same as `--host`), stays up, and serves HTTP.
+- `GET /healthz` → 200.
+- `POST /v1/chat` → runs the **existing agent loop** by spawning a `--agent`
+  child for the requested `provider[:model]`, then relays its result as SSE
+  (`session` → `text_delta` → `turn_done`). Single session, serialized turns.
 
 ### Concurrency model
 
@@ -190,31 +214,33 @@ reassembles them in task order.
 
 ---
 
-## 6. Grok Bot integration
+## 6. Driver integration (any API backend)
 
-Grok Bot = xAI's hosted agent product (Cursor/Anysphere cloud), per-member
-persistent VM (browser + fs + terminal), connectors, skills/routines,
-approvals/Auto Review, bot-to-bot coordination.
+HalBot is a generic HTTP+SSE backend. **Any driver** can use it; there is no
+Grok-specific coupling. A driver integration is just:
 
-HalBot appears to Grok Bot as **one connector** (or one skill) whose action is
-"talk to the local HalBot API". Mapping:
+1. A connector/skill/script that POSTs to `POST /v1/chat` (or the task queue).
+2. A consumer that reads the SSE stream and renders deltas / tool calls /
+   approvals in its own UI.
 
-| Grok Bot concept | HalBot equivalent |
+Mapping for a hosted-bot-style driver (Grok/Claude/Cursor/ChatGPT all fit this):
+
+| Driver concept | HalBot equivalent |
 |---|---|
 | Connector | `--serve` HTTP endpoint registered as a connector action |
 | Skill / routine | `skills/<domain>/SKILL.md` + an optional `cc_*_ipc.x` tool |
 | Tool | one of the 26 `cc_*_ipc.x` tools, surfaced via `/v1/tools` |
 | Approval / Auto Review | HalBot permission layer (§7) with an approval callback |
-| Bot-to-bot coordination | HalBot coordinator → Grok Bot API as a peer, or Grok Bot polls `/v1/tasks` |
+| Bot-to-bot coordination | HalBot coordinator → driver API as a peer, or driver polls `/v1/tasks` |
 
 ### Two supported topologies
 
-**A. Grok Bot drives HalBot (default).** Grok Bot POSTs to `/v1/chat`, consumes
+**A. Driver drives HalBot (default).** The driver POSTs to `/v1/chat`, consumes
 SSE, and surfaces approvals in its UI. HalBot is the executor of record.
 
 **B. HalBot is the always-on coordinator.** HalBot runs its own task queue and
-reaches out to Grok Bot (or other bots) as peers via the Grok Bot API. This is
-the "self-hosted always-on agent" flavor.
+reaches out to other bots/drivers as peers. This is the "self-hosted always-on
+agent" flavor.
 
 The spec targets **A first** (smaller surface, matches "API via web"), with B
 enabled by §5's coordinator loop already being the owner of the queue.
@@ -230,47 +256,52 @@ session was opened with `"approval": "allowlist"` and the tool is listed.
 
 Approval flows (order of preference):
 
-1. **Callback** — HalBot POSTs an approval request to the configured Grok Bot
+1. **Callback** — HalBot POSTs an approval request to the configured driver
    webhook; blocks the tool until `approved|denied` returns (with timeout).
 2. **Inline** — HalBot emits an `approval_required` SSE event and waits for the
    driver to POST `/v1/sessions/{id}/approvals`.
-3. **Auto Review** — Grok Bot's Auto Review consumes the same `approval_required`
-   event and applies its policy without a human.
+3. **Auto Review** — the driver's model-based review consumes the same
+   `approval_required` event and applies its policy without a human.
 
 ---
 
-## 7. Security / isolation (VM boundary)
+## 7. Security / isolation (the bot's own machine)
 
 - HalBot binds `127.0.0.1` by default; `--bind 0.0.0.0` is opt-in (remote drivers).
 - Bearer token required; generated and stored in `~/.halcode/keys.env`.
-- Worker sandboxing (landlock/chroot) is a **Phase 5** item; until then workers
-  inherit the VM's permissions and the WSL2 RULES command blocklist.
+- **The VM is the bot's machine.** Every tool operates on the VM's own
+  filesystem. Install/modify/build operations (Bash, Write, Edit, Ailang
+  compile, Packager, Git) are first-class and intentionally unrestricted *on
+  that machine* — the bot is meant to be able to change its own environment.
+- The boundary that matters is **VM ↔ host**. HalBot never escapes the VM:
+  worker sandboxing (landlock/chroot) is a **Phase 5** hardening item; until
+  then workers inherit the VM's permissions and the WSL2 RULES command
+  blocklist applies on WSL hosts.
 - Secrets live in env/`keys.env`, never in history or parked results.
 - Per-session token budget and tool-call caps mirror the existing WSL2 chain limit.
 
 ---
 
-## 8. Open questions — resolved (xAI docs dive)
+## 8. Open questions — resolved (API integration dive)
 
-1. **Connector loopback — NO loopback.** Grok rejects `localhost` and private-IP
-   URLs for custom MCP connectors; the server must be reachable over the public
-   internet. Grok -> HalBot therefore needs a **tunnel** (ngrok — Cloudflare
-   quick tunnels do not support SSE). Deferred until core tech is hardened.
-2. **VM reachability — not relevant yet.** Grok Bot's computer runs in Cursor's
-   cloud, not our VM. Remote/web/phone access is explicitly deferred until the
-   core is secured and hardened; `--bind`/TLS decisions move to a later phase.
-3. **Approvals — inline + Auto-review, no webhook.** Grok Bot approval is
-   **Allow once / Deny / Always allow** cards in conversation, plus **Auto
-   Review** rules ("Ask first" vs "Allow automatically"; model-based; "Ask
-   first" wins). No outbound approval webhook exists. HalBot's approval surface
-   is therefore its own API (inline card + callback), with Auto Review as a
-   model-based pre-flight gate.
+1. **Connector loopback — NO loopback for hosted bots.** Hosted bot products
+   reject `localhost`/private-IP URLs for custom connectors; the server must be
+   reachable over the public internet. Remote drivers therefore need a
+   **tunnel** (ngrok — Cloudflare quick tunnels do not support SSE). Deferred
+   until core tech is hardened.
+2. **VM reachability — not relevant yet.** A hosted bot's computer runs in its
+   own cloud VM, not our VM. Remote/web/phone access is explicitly deferred
+   until the core is secured and hardened; `--bind`/TLS decisions move to a
+   later phase. HalBot's own machine (the VM it runs in) is local-first.
+3. **Approvals — inline + Auto-review, no webhook required.** Hosted-bot
+   approval is card-style (Allow once / Deny / Always allow) plus model-based
+   Auto Review ("Ask first" vs "Allow automatically"; "Ask first" wins).
+   HalBot's approval surface is therefore its own API (inline card + callback),
+   with Auto Review as a model-based pre-flight gate.
 4. **Worker model — fixed, configurable.** Worker provider/model was hardcoded
    (`--agent deepseek`). Now: per-call `model` arg on the Agent tool ->
-   `HALCODE_WORKER` env var -> built-in `deepseek`. `grok-3`/`grok-3-mini` are
-   retired; `providers/xai.json` now lists grok-4.6 / grok-4.5 / grok-4.3 /
-   grok-4.20-{reasoning,non-reasoning,multi-agent} / grok-code-fast-1 (default
-   `grok-4.6`).
+   `HALCODE_WORKER` env var -> built-in `deepseek`. Any provider in
+   `providers/*.json` is routable.
 5. **TLS — loopback + bearer for Phase 1.** Remote access is deferred; TLS is a
    later hardening item, not Phase 1.
 
@@ -279,13 +310,12 @@ Approval flows (order of preference):
 - `cc_tools/cc_agent_ipc.ailang`: added optional `model` field; worker spec
   precedence is `model` arg -> `HALCODE_WORKER` -> `deepseek`.
 - `HalCode9000.ailang`: added `CC_ResolveWorkerSpec()` (`HALCODE_WORKER` ->
-  `deepseek`); MCP mode now uses it instead of hardcoded `"deepseek"`; Grok
-  default bumped `grok-3` -> `grok-4.6`.
+  `deepseek`); MCP mode now uses it instead of hardcoded `"deepseek"`.
 - `providers/xai.json`: refreshed to current xAI model list.
-- **Build note:** `cc_agent_ipc.ailang` compiles cleanly. `HalCode9000.ailang`
-  currently fails with a pre-existing error unrelated to these edits
-  (`ANSICanvas.SetPixel`/`ANSICanvas_SGR` have 8 inputs > SysV 6-register
-  limit); it blocks rebuilding `HalCode9000.x` and must be fixed separately.
+- **Build note (resolved):** the prior `ANSICanvas.SetPixel` 8-input > 6-register
+  compile error was fixed in commit `94ac3ad` ("drop ANSICanvas import"). This
+  section previously claimed it still blocked the build; that note is now stale
+  and the main binary builds cleanly (596812 bytes).
 
 ---
 
@@ -293,12 +323,12 @@ Approval flows (order of preference):
 
 | Phase | Deliverable |
 |---|---|
-| 0 | This spec (done) |
+| 0 | This spec (done, reframed v0.2) |
 | 1 | `--serve` mode: `/healthz`, `/v1/chat` + SSE, single session, reused agent loop |
 | 2 | Sessions: `/v1/sessions/*`, `/v1/tools`, auth |
 | 3 | Task queue: `/v1/tasks`, coordinator routing, `hc_tasks` wiring |
-| 4 | Grok Bot connector + approval callback |
-| 5 | Sandboxing, multi-session/multi-bot coordination, TLS |
+| 4 | Driver connector (any backend) + approval callback |
+| 5 | Sandboxing (VM↔host), multi-session/multi-bot coordination, TLS |
 
 ---
 

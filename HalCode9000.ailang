@@ -5101,6 +5101,337 @@ Function.CC_RunMCPMode {
 }
 
 // =============================================================================
+// WEB API MODE — ./HalCode9000.x --serve [--port N]
+// Phase 1: GET /healthz + POST /v1/chat (SSE). Reuses the existing --agent
+// loop by spawning a worker child per turn. Self-contained tool parent (same
+// boot path as --host): boot tools, start AgentProxy, serve HTTP.
+// =============================================================================
+Function.CC_Serve_WriteStr {
+    Input: fd: Integer
+    Input: s: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        slen = StringLength(s)
+        IfCondition GreaterThan(slen, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_WRITE, fd, s, slen, 0, 0)
+        }
+    }
+}
+
+Function.CC_Serve_SendEvent {
+    Input: fd: Integer
+    Input: event: Address
+    Input: data: Address
+    Body: {
+        ev = "event: "
+        ev = StringConcat(ev, event)
+        ev = StringConcat(ev, "\ndata: ")
+        ev = StringConcat(ev, data)
+        ev = StringConcat(ev, "\n\n")
+        CC_Serve_WriteStr(fd, ev)
+    }
+}
+
+Function.CC_Serve_SendResponse {
+    Input: fd: Integer
+    Input: status_line: Address
+    Input: content_type: Address
+    Input: body: Address
+    Body: {
+        blen = StringLength(body)
+        r = "HTTP/1.1 "
+        r = StringConcat(r, status_line)
+        r = StringConcat(r, "\r\nContent-Type: ")
+        r = StringConcat(r, content_type)
+        r = StringConcat(r, "\r\nContent-Length: ")
+        r = StringConcat(r, NumberToString(blen))
+        r = StringConcat(r, "\r\nConnection: close\r\n\r\n")
+        r = StringConcat(r, body)
+        CC_Serve_WriteStr(fd, r)
+    }
+}
+
+Function.CC_Serve_GetContentLength {
+    Input: headers: Address
+    Output: Integer
+    Body: {
+        p = StringIndexOf(headers, "Content-Length:")
+        IfCondition LessThan(p, 0) ThenBlock: {
+            p = StringIndexOf(headers, "content-length:")
+        }
+        IfCondition LessThan(p, 0) ThenBlock: { ReturnValue(0) }
+        p = Add(p, 15)
+        WhileLoop EqualTo(GetByte(headers, p), 32) {
+            p = Add(p, 1)
+        }
+        val = 0
+        WhileLoop 1 {
+            c = GetByte(headers, p)
+            IfCondition Or(LessThan(c, 48), GreaterThan(c, 57)) ThenBlock: { BreakLoop }
+            val = Add(Multiply(val, 10), Subtract(c, 48))
+            p = Add(p, 1)
+        }
+        ReturnValue(val)
+    }
+}
+
+Function.CC_Serve_ReadRequest {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: buf_size: Integer
+    Output: Integer
+    Body: {
+        total = 0
+        header_end = -1
+        content_len = 0
+        WhileLoop LessThan(total, Subtract(buf_size, 1)) {
+            n = SystemCall(CCSys.SYS_READ, fd, Add(buf, total), Subtract(Subtract(buf_size, 1), total), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total = Add(total, n)
+            SetByte(buf, total, 0)
+            header_end = StringIndexOf(buf, "\r\n\r\n")
+            IfCondition GreaterEqual(header_end, 0) ThenBlock: {
+                content_len = CC_Serve_GetContentLength(buf)
+                body_start = Add(header_end, 4)
+                IfCondition GreaterEqual(total, Add(body_start, content_len)) ThenBlock: {
+                    BreakLoop
+                }
+            }
+        }
+        SetByte(buf, total, 0)
+        ReturnValue(total)
+    }
+}
+
+Function.CC_Serve_RunAgent {
+    Input: spec: Address
+    Input: prompt: Address
+    Input: out_buf: Address
+    Input: out_max: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(spec, 0) ThenBlock: { spec = "deepseek" }
+
+        in_path = "/tmp/hal_serve_in.txt"
+        out_path = "/tmp/hal_serve_out.txt"
+        log_path = "/tmp/hal_serve.log"
+
+        fd = SystemCall(CCSys.SYS_OPEN, in_path, 577, 384, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_WRITE, fd, prompt, StringLength(prompt), 0, 0)
+            SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        }
+        SystemCall(CCSys.SYS_UNLINK, out_path, 0, 0, 0, 0)
+
+        envp = CC_BuildInheritedEnvp()
+
+        cmd = "timeout 300 ./HalCode9000.x --agent "
+        cmd = StringConcat(cmd, spec)
+        cmd = StringConcat(cmd, " < ")
+        cmd = StringConcat(cmd, in_path)
+        cmd = StringConcat(cmd, " > ")
+        cmd = StringConcat(cmd, out_path)
+        cmd = StringConcat(cmd, " 2>>")
+        cmd = StringConcat(cmd, log_path)
+
+        pid = SystemCall(CCSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0), "/bin/sh")
+            StoreValue(Add(argv, 8), "-c")
+            StoreValue(Add(argv, 16), cmd)
+            StoreValue(Add(argv, 24), 0)
+            SystemCall(CCSys.SYS_EXECVE, "/bin/sh", argv, envp)
+            SystemCall(CCSys.SYS_EXIT, 1, 0, 0, 0, 0)
+        }
+
+        wstat = Allocate(8)
+        StoreValue(wstat, 0)
+        SystemCall(CCSys.SYS_WAIT4, pid, wstat, 0, 0, 0)
+        Deallocate(wstat, 8)
+
+        n = 0
+        ofd = SystemCall(CCSys.SYS_OPEN, out_path, 0, 0, 0, 0)
+        IfCondition GreaterEqual(ofd, 0) ThenBlock: {
+            n = SystemCall(CCSys.SYS_READ, ofd, out_buf, Subtract(out_max, 1), 0, 0)
+            SystemCall(CCSys.SYS_CLOSE, ofd, 0, 0, 0, 0)
+        }
+        IfCondition LessThan(n, 0) ThenBlock: { n = 0 }
+        SetByte(out_buf, n, 0)
+        ReturnValue(n)
+    }
+}
+
+Function.CC_Serve_HandleChat {
+    Input: fd: Integer
+    Input: body_ptr: Address
+    Body: {
+        msg = ""
+        prov = 0
+        model = 0
+        IfCondition NotEqual(body_ptr, 0) ThenBlock: {
+            parsed = ParseJSON(body_ptr)
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                obj = JSON.AsObject(parsed)
+                IfCondition NotEqual(obj, 0) ThenBlock: {
+                    m = JSON.GetString(obj, "message")
+                    IfCondition NotEqual(m, 0) ThenBlock: { msg = m }
+                    prov = JSON.GetString(obj, "provider")
+                    model = JSON.GetString(obj, "model")
+                }
+            }
+        }
+
+        IfCondition EqualTo(StringLength(msg), 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"missing message\"}")
+            ReturnValue(0)
+        }
+
+        spec = 0
+        IfCondition And(NotEqual(prov, 0), NotEqual(model, 0)) ThenBlock: {
+            spec = StringConcat(prov, ":")
+            spec = StringConcat(spec, model)
+        } ElseBlock: {
+            IfCondition NotEqual(prov, 0) ThenBlock: {
+                spec = prov
+            } ElseBlock: {
+                spec = CC_ResolveWorkerSpec()
+            }
+        }
+
+        sid = CC_GenerateSessionGUID()
+
+        CC_Serve_WriteStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
+
+        sobj = JSON.NewObject()
+        JSON.SetString(sobj, "session_id", sid)
+        JSON.SetString(sobj, "model", spec)
+        CC_Serve_SendEvent(fd, "session", JSON.SerializeObject(sobj))
+
+        out_buf = Allocate(1048576)
+        n = CC_Serve_RunAgent(spec, msg, out_buf, 1048576)
+
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            tobj = JSON.NewObject()
+            JSON.SetString(tobj, "text", out_buf)
+            CC_Serve_SendEvent(fd, "text_delta", JSON.SerializeObject(tobj))
+        }
+
+        dobj = JSON.NewObject()
+        JSON.SetString(dobj, "stop_reason", "end_turn")
+        CC_Serve_SendEvent(fd, "turn_done", JSON.SerializeObject(dobj))
+    }
+}
+
+Function.CC_Serve_HandleClient {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: buf_size: Integer
+    Body: {
+        total = CC_Serve_ReadRequest(fd, buf, buf_size)
+        IfCondition LessEqual(total, 0) ThenBlock: { ReturnValue(0) }
+
+        sp = StringIndexOf(buf, " ")
+        IfCondition LessThan(sp, 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false}")
+            ReturnValue(0)
+        }
+
+        method = StringSubstring(buf, 0, sp)
+        rest_start = Add(sp, 1)
+        sp2 = StringIndexOf(Add(buf, rest_start), " ")
+        IfCondition LessThan(sp2, 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false}")
+            ReturnValue(0)
+        }
+        path_end = Add(rest_start, sp2)
+        path = StringSubstring(buf, rest_start, path_end)
+
+        header_end = StringIndexOf(buf, "\r\n\r\n")
+        body_ptr = 0
+        IfCondition GreaterEqual(header_end, 0) ThenBlock: {
+            body_ptr = Add(buf, Add(header_end, 4))
+        }
+
+        is_healthz = StringCompare(path, "/healthz")
+        is_chat = StringCompare(path, "/v1/chat")
+        is_get = StringCompare(method, "GET")
+        is_post = StringCompare(method, "POST")
+
+        IfCondition And(EqualTo(is_healthz, 0), EqualTo(is_get, 0)) ThenBlock: {
+            CC_Serve_SendResponse(fd, "200 OK", "application/json", "{\"ok\":true}")
+        } ElseBlock: {
+            IfCondition And(EqualTo(is_chat, 0), EqualTo(is_post, 0)) ThenBlock: {
+                CC_Serve_HandleChat(fd, body_ptr)
+            } ElseBlock: {
+                CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"not found\"}")
+            }
+        }
+    }
+}
+
+Function.CC_RunServeMode {
+    Body: {
+        CC_ChdirToBinDir()
+        SystemCall(CCSys.SYS_MKDIR, "/tmp/halcode_app", 493, 0, 0, 0)
+        History.Init()
+        IPCDispatch.Init()
+        CC_KillStaleTools()
+        CC_BootTools()
+        IPCDispatch.StartProxy()
+        CC_RestorePgmemUi(0)
+
+        port = 8080
+        port_str = CC_ReadArgValue("--port")
+        IfCondition NotEqual(port_str, 0) ThenBlock: {
+            pv = StringToInt(port_str)
+            IfCondition GreaterThan(pv, 0) ThenBlock: { port = pv }
+        }
+
+        server_fd = Socket.Create(2, 1)
+        IfCondition LessThan(server_fd, 0) ThenBlock: {
+            CC_WriteStdout("[serve] socket create failed\n")
+            ReturnValue(0)
+        }
+
+        opt = Allocate(4)
+        StoreValue(opt, 1, "dword")
+        SystemCall(54, server_fd, 1, 2, opt, 4)
+        Deallocate(opt, 4)
+
+        addr = Socket.CreateAddr("127.0.0.1", port)
+        brc = SystemCall(49, server_fd, addr, 16, 0, 0)
+        Deallocate(addr, 16)
+        IfCondition LessThan(brc, 0) ThenBlock: {
+            CC_WriteStdout("[serve] bind failed (port busy?)\n")
+            Socket.Close(server_fd)
+            ReturnValue(0)
+        }
+
+        lrc = Socket.Listen(server_fd, 16)
+        IfCondition LessThan(lrc, 0) ThenBlock: {
+            CC_WriteStdout("[serve] listen failed\n")
+            Socket.Close(server_fd)
+            ReturnValue(0)
+        }
+
+        CC_WriteStdout("[serve] listening on 127.0.0.1:")
+        CC_WriteStdout(NumberToString(port))
+        CC_WriteStdout("\n")
+
+        buf = Allocate(65536)
+        WhileLoop 1 {
+            client_fd = Socket.Accept(server_fd)
+            IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+                Socket.SetRecvTimeout(client_fd, 30000)
+                CC_Serve_HandleClient(client_fd, buf, 65536)
+                Socket.Close(client_fd)
+            }
+        }
+    }
+}
+
+// =============================================================================
 // MAIN
 // =============================================================================
 SubRoutine.Main {
@@ -5164,6 +5495,22 @@ SubRoutine.Main {
             SystemCall(CCSys.SYS_CLOSE, saved_out, 0, 0, 0, 0)
         }
         CC_RunMCPMode()
+        SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+    }
+
+    // Web API mode: ./HalCode9000.x --serve [--port N]
+    // Self-contained HTTP+SSE backend; boots tools + AgentProxy like --host.
+    serve_flag = CC_HasArg("--serve")
+    IfCondition EqualTo(serve_flag, 1) ThenBlock: {
+        serve_sig = Allocate(32)
+        StoreValue(Add(serve_sig, 0), 0)
+        StoreValue(Add(serve_sig, 8), 0)
+        StoreValue(Add(serve_sig, 16), 0)
+        StoreValue(Add(serve_sig, 24), 0)
+        SystemCall(13, 2, serve_sig, 0, 8, 0)
+        SystemCall(13, 15, serve_sig, 0, 8, 0)
+        Deallocate(serve_sig, 32)
+        CC_RunServeMode()
         SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
     }
 

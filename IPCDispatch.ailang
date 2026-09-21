@@ -45,6 +45,8 @@ FixedPool.IPCDState {
     "proxy_polling":    Initialize=0,  CanChange=True  // re-entrancy guard
     "proxy_mode":       Initialize=0,  CanChange=True  // 1=agent worker, route all calls to parent
     "proxy_conn_fd":    Initialize=-1, CanChange=True  // agent's connection to parent proxy
+    "respawn_pids":     Initialize=0,  CanChange=True  // tracked PIDs of respawned workers (8-byte slots)
+    "respawn_count":    Initialize=0,  CanChange=True
 }
 
 // =============================================================================
@@ -69,6 +71,43 @@ Function.IPCDispatch.Shutdown {
             i = Add(i, 1)
         }
         IPCDState.count = 0
+
+        // Reap every worker this module respawned so a parent exit can't leak
+        // them. PR_SET_PDEATHSIG is unreliable on WSL2, so explicit kill+wait
+        // is the only guaranteed cleanup (mirrors CC_KillAllChildren).
+        IfCondition GreaterThan(IPCDState.respawn_count, 0) ThenBlock: {
+            r_ws = Allocate(8)
+            r_i = 0
+            WhileLoop LessThan(r_i, IPCDState.respawn_count) {
+                r_pid = Dereference(Add(IPCDState.respawn_pids, Multiply(r_i, 8)))
+                IfCondition GreaterThan(r_pid, 0) ThenBlock: {
+                    SystemCall(62, r_pid, 15, 0, 0, 0)
+                }
+                r_i = Add(r_i, 1)
+            }
+            r_ts = Allocate(16)
+            StoreValue(r_ts, 0)
+            StoreValue(Add(r_ts, 8), 500000000)
+            SystemCall(35, r_ts, 0, 0, 0, 0)
+            Deallocate(r_ts, 16)
+            r_i = 0
+            WhileLoop LessThan(r_i, IPCDState.respawn_count) {
+                r_pid = Dereference(Add(IPCDState.respawn_pids, Multiply(r_i, 8)))
+                IfCondition GreaterThan(r_pid, 0) ThenBlock: {
+                    StoreValue(r_ws, 0)
+                    r_wr = SystemCall(61, r_pid, r_ws, 1, 0, 0)
+                    IfCondition EqualTo(r_wr, 0) ThenBlock: {
+                        SystemCall(62, r_pid, 9, 0, 0, 0)
+                        StoreValue(r_ws, 0)
+                        SystemCall(61, r_pid, r_ws, 0, 0, 0)
+                    }
+                    StoreValue(Add(IPCDState.respawn_pids, Multiply(r_i, 8)), 0)
+                }
+                r_i = Add(r_i, 1)
+            }
+            Deallocate(r_ws, 8)
+            IPCDState.respawn_count = 0
+        }
     }
 }
 
@@ -517,7 +556,40 @@ Function.IPCDispatch_TryConnect {
     }
 }
 
-// Fork+exec a dead worker. Empty envp is enough: binary is a relative path.
+// Build the full inherited environment as a NULL-terminated char*[] suitable
+// for execve(3). Reading /proc/self/environ in the PARENT (before fork) means
+// the buffer is shared copy-on-write with the child — same technique as
+// CC_BuildInheritedEnvp in the parent binary.
+Function.IPCDispatch_BuildEnvp {
+    Output: Address
+    Body: {
+        fd = SystemCall(2, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16384)
+        n = SystemCall(0, fd, buf, 16384, 0, 0)
+        SystemCall(3, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        envp = Allocate(4096)
+        idx = 0
+        StoreValue(Add(envp, 0), buf)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: {
+                next_pos = Add(i, 1)
+                IfCondition LessThan(next_pos, n) ThenBlock: {
+                    idx = Add(idx, 1)
+                    StoreValue(Add(envp, Multiply(idx, 8)), Add(buf, next_pos))
+                }
+            }
+            i = Add(i, 1)
+        }
+        StoreValue(Add(envp, Multiply(Add(idx, 1), 8)), 0)
+        ReturnValue(envp)
+    }
+}
+
+// Fork+exec a dead worker. The first boot (CC_LaunchTool) passes the full
+// inherited environment; an empty envp makes cc_*_ipc.x crash on startup.
 Function.IPCDispatch_Respawn {
     Input: bin: Address
     Input: name: Address
@@ -526,22 +598,43 @@ Function.IPCDispatch_Respawn {
     Body: {
         IfCondition Or(EqualTo(bin, 0), EqualTo(sock_path, 0)) ThenBlock: { ReturnValue(0) }
         IPCDispatch_ReapZombies()
+        // Build the inherited envp BEFORE fork so the child inherits it COW.
+        envp = IPCDispatch_BuildEnvp()
+        IfCondition EqualTo(envp, 0) ThenBlock: {
+            IPCD_Log("[ipcd] respawn FAIL build_envp\n")
+        }
         pid = SystemCall(57, 0, 0, 0, 0, 0)
         IfCondition EqualTo(pid, 0) ThenBlock: {
             SystemCall(157, 1, 15, 0, 0, 0)
+            // Silence stdout/stderr so the worker never clobbers the TUI.
+            devnull = SystemCall(2, "/dev/null", 1, 0, 0, 0)
+            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
+                SystemCall(33, devnull, 1, 0, 0, 0)
+                SystemCall(33, devnull, 2, 0, 0, 0)
+                SystemCall(3, devnull, 0, 0, 0, 0)
+            }
             argv = Allocate(32)
             StoreValue(argv, bin)
             StoreValue(Add(argv, 8), name)
             StoreValue(Add(argv, 16), sock_path)
             StoreValue(Add(argv, 24), 0)
-            envp = Allocate(8)
-            StoreValue(envp, 0)
             SystemCall(59, bin, argv, envp)
             SystemCall(60, 127, 0, 0, 0, 0)
         }
         IfCondition LessThan(pid, 0) ThenBlock: {
             IPCD_Log("[ipcd] respawn fork failed\n")
             ReturnValue(0)
+        }
+        // Track the PID so IPCDispatch.Shutdown can SIGTERM/reap it — the
+        // respawn path previously leaked workers on exit (WSL2 PDEATHSIG gap).
+        IfCondition EqualTo(IPCDState.respawn_pids, 0) ThenBlock: {
+            IPCDState.respawn_pids = Allocate(Multiply(64, 8))
+            MemorySet(IPCDState.respawn_pids, 0, Multiply(64, 8))
+        }
+        IfCondition LessThan(IPCDState.respawn_count, 64) ThenBlock: {
+            r_slot = Multiply(IPCDState.respawn_count, 8)
+            StoreValue(Add(IPCDState.respawn_pids, r_slot), pid)
+            IPCDState.respawn_count = Add(IPCDState.respawn_count, 1)
         }
         IPCD_Log("[ipcd] respawned ")
         IPCD_Log(name)
