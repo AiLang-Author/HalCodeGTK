@@ -46,7 +46,8 @@ uninstall() {
           "$ICON_DIR/128x128/apps/${APP_ID}.png" \
           "$ICON_DIR/256x256/apps/${APP_ID}.png" \
           "$USER_DESKTOP/${APP_ID}.desktop" \
-          "$BIN_DIR/halcode"
+          "$BIN_DIR/halcode" \
+          "$BIN_DIR/lastlog"
     update-desktop-database "$DESKTOP_DIR" 2>/dev/null || true
     gtk-update-icon-cache -f "$ICON_DIR" 2>/dev/null || true
     log "Removed Applications menu entry ($APP_ID)"
@@ -96,6 +97,12 @@ chmod 644 "$DESKTOP_FILE"
 ln -sfn "$EXEC" "$BIN_DIR/halcode"
 chmod +x "$EXEC"
 
+LASTLOG="$ROOT/scripts/lastlog.sh"
+if [[ -f "$LASTLOG" ]]; then
+    chmod +x "$LASTLOG"
+    ln -sfn "$LASTLOG" "$BIN_DIR/lastlog"
+fi
+
 if [[ "$WANT_DESKTOP_LINK" -eq 1 && -d "$USER_DESKTOP" ]]; then
     cp -f "$DESKTOP_FILE" "$USER_DESKTOP/${APP_ID}.desktop"
     chmod 644 "$USER_DESKTOP/${APP_ID}.desktop"
@@ -111,5 +118,6 @@ log "Applications menu: HalCode9000"
 info "launcher: $EXEC"
 info "desktop:  $DESKTOP_FILE"
 info "command:  $BIN_DIR/halcode"
+info "lastlog:  $BIN_DIR/lastlog"
 info "Rebuild in place: make -C $ROOT/shell desk halcode_shell_gtk"
 info "Then open HalCode9000 again (replaces the running window)."
