@@ -24,7 +24,6 @@ LibraryImport.StringUtils
 LibraryImport.HTTP
 LibraryImport.SSE
 LibraryImport.OAuth
-LibraryImport.ANSICanvas
 LibraryImport.ThreadTrampoline
 Import.Applications.HalCode9000.History
 Import.Applications.HalCode9000.UI
@@ -3810,7 +3809,7 @@ Function.CC_SetupAgentProvider {
         }
         IfCondition And(EqualTo(matched, 0), EqualTo(StringCompare(prov_name, "grok"), 0)) ThenBlock: {
             CC_MakeProvider("Grok", "openai", "https://api.x.ai",
-                            "/v1/chat/completions", "grok-3", "xai")
+                            "/v1/chat/completions", "grok-4.6", "xai")
             cred = CC_GetEnv("XAI_API_KEY")
             matched = 1
         }
@@ -3847,6 +3846,19 @@ Function.CC_SetupAgentProvider {
         }
         IfCondition EqualTo(cred, 0) ThenBlock: { cred = "" }
         ReturnValue(cred)
+    }
+}
+
+// Resolve the worker provider[:model] spec for headless workers.
+// Precedence: HALCODE_WORKER env var > built-in default "deepseek".
+Function.CC_ResolveWorkerSpec {
+    Output: Address
+    Body: {
+        spec = CC_GetEnv("HALCODE_WORKER")
+        IfCondition NotEqual(spec, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(spec), 0) ThenBlock: { ReturnValue(spec) }
+        }
+        ReturnValue("deepseek")
     }
 }
 
@@ -5129,7 +5141,7 @@ SubRoutine.Main {
         CC_KillStaleTools()
         History.Init()
         IPCDispatch.Init()
-        cred = CC_SetupAgentProvider("deepseek")
+        cred = CC_SetupAgentProvider(CC_ResolveWorkerSpec())
         CCConst.SYSTEM_PROMPT = CC_EnsureSystemPrompt()
         Backend.Init("apikey", cred, CCConst.SYSTEM_PROMPT)
         // Respond to initialize immediately so health checks pass before schema boot.

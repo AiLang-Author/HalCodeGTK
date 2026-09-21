@@ -1,6 +1,7 @@
 // cc_agent_ipc.ailang — HalCode9000 Sub-Agent Orchestrator
 //
-// Spawns a DeepSeek-v4-Flash worker using the standalone deepseek.x CLI.
+// Spawns a headless worker via ./HalCode9000.x --agent <provider[:model]>.
+// Worker spec precedence: per-call "model" arg > HALCODE_WORKER env > "deepseek".
 // Handles writing the context to a temp file, executing the worker, and
 // reading the result back to the orchestrator.
 //
@@ -39,7 +40,7 @@ FixedPool.AgentState {
     "running":       Initialize=1, CanChange=True
 }
 
-// Inherit environment variables so DEEPSEEK_API_KEY is passed down to deepseek.x
+// Inherit environment variables (API keys, HALCODE_WORKER) for the worker.
 Function.Agent_BuildInheritedEnvp {
     Output: Address
     Body: {
@@ -69,14 +70,72 @@ Function.Agent_BuildInheritedEnvp {
     }
 }
 
+// Read $VAR from /proc/self/environ. Returns 0 if not set.
+Function.Agent_GetEnv {
+    Input: var_name: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(AgentSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(65536)
+        n = SystemCall(AgentSys.SYS_READ, fd, buf, 65536, 0, 0)
+        SystemCall(AgentSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 65536)
+            ReturnValue(0)
+        }
+        var_len = StringLength(var_name)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, var_len) {
+                IfCondition NotEqual(GetByte(buf, Add(i, j)), GetByte(var_name, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, var_len)), 61) ThenBlock: {
+                    val_start = Add(i, Add(var_len, 1))
+                    val_end = val_start
+                    WhileLoop LessThan(val_end, n) {
+                        IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                        val_end = Add(val_end, 1)
+                    }
+                    val_len = Subtract(val_end, val_start)
+                    out = Allocate(Add(val_len, 1))
+                    k = 0
+                    WhileLoop LessThan(k, val_len) {
+                        SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                        k = Add(k, 1)
+                    }
+                    SetByte(out, val_len, 0)
+                    Deallocate(buf, 65536)
+                    ReturnValue(out)
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 65536)
+        ReturnValue(0)
+    }
+}
+
 Function.Agent_BuildSchema {
     Output: Address
     Body: {
-        s = UtilArgs_NewSchema("Agent", "Spawns a background DeepSeek-v4-Flash sub-agent to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem.")
+        s = UtilArgs_NewSchema("Agent", "Spawns a background sub-agent worker to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem. Worker provider/model is configurable via the optional 'model' field (provider[:model]), else the HALCODE_WORKER env var, else the built-in default.")
         UtilArgs_AddField(s, "task_id", "string", 0, "The Task ID in pgmem (optional).", "task_id")
         UtilArgs_AddField(s, "task_prompt", "string", 1, "The instructions or goal for the sub-agent.", "task_prompt")
         UtilArgs_AddField(s, "context_key", "string", 1, "The Pgmem key to pickup context data from.", "context_key")
         UtilArgs_AddField(s, "result_key", "string", 1, "The Pgmem key to park the result to.", "result_key")
+        UtilArgs_AddField(s, "model", "string", 0, "Optional worker provider[:model] spec (e.g. 'deepseek', 'openai:gpt-4o'). Defaults to HALCODE_WORKER env var, then 'deepseek'.", "model")
         ReturnValue(s)
     }
 }
@@ -112,7 +171,7 @@ Function.Agent_SendResult {
 Function.Agent_SendSchema {
     Input: client_fd: Integer
     Body: {
-        schema_str = "{\"name\":\"Agent\",\"description\":\"Spawns a background DeepSeek-v4-Flash sub-agent to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"task_id\":{\"type\":\"string\",\"description\":\"The Task ID in pgmem (optional).\"},\"task_prompt\":{\"type\":\"string\",\"description\":\"The instructions or goal for the sub-agent.\"},\"context_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to pickup context data from.\"},\"result_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to park the result to.\"}},\"required\":[\"task_prompt\",\"context_key\",\"result_key\"]}}"
+        schema_str = "{\"name\":\"Agent\",\"description\":\"Spawns a background sub-agent worker to process a task asynchronously. Pulls input from Pgmem and parks output in Pgmem. Worker provider/model is configurable via the optional 'model' field (provider[:model]), else the HALCODE_WORKER env var, else the built-in default.\",\"input_schema\":{\"type\":\"object\",\"properties\":{\"task_id\":{\"type\":\"string\",\"description\":\"The Task ID in pgmem (optional).\"},\"task_prompt\":{\"type\":\"string\",\"description\":\"The instructions or goal for the sub-agent.\"},\"context_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to pickup context data from.\"},\"result_key\":{\"type\":\"string\",\"description\":\"The Pgmem key to park the result to.\"},\"model\":{\"type\":\"string\",\"description\":\"Optional worker provider[:model] spec (e.g. 'deepseek', 'openai:gpt-4o'). Defaults to HALCODE_WORKER env var, then 'deepseek'.\"}},\"required\":[\"task_prompt\",\"context_key\",\"result_key\"]}}"
         resp_str = StringConcat("{\"method\":\"schema_response\",\"schema\":", schema_str)
         resp_str = StringConcat(resp_str, "}")
         Socket.SendMsg(client_fd, resp_str)
@@ -187,6 +246,7 @@ Function.Agent_HandleRequest {
             t_prompt = UtilArgs_GetString(validated, "task_prompt")
             c_key = UtilArgs_GetString(validated, "context_key")
             r_key = UtilArgs_GetString(validated, "result_key")
+            m_arg = UtilArgs_GetString(validated, "model")
             
             IfCondition EqualTo(t_id, 0) ThenBlock: { t_id = "unknown" }
 
@@ -205,6 +265,17 @@ Function.Agent_HandleRequest {
                 Agent_LogMsg(log_path, StringConcat("[daemon] task_id=", t_id))
                 Agent_LogMsg(log_path, StringConcat("[daemon] context_key=", c_key))
                 Agent_LogMsg(log_path, StringConcat("[daemon] result_key=", r_key))
+
+                worker_spec = m_arg
+                IfCondition EqualTo(worker_spec, 0) ThenBlock: {
+                    worker_spec = Agent_GetEnv("HALCODE_WORKER")
+                }
+                IfCondition EqualTo(worker_spec, 0) ThenBlock: {
+                    worker_spec = "deepseek"
+                }
+                Agent_LogMsg(log_path, StringConcat("[daemon] worker_spec=", worker_spec))
+                cmd_prefix = StringConcat("timeout 300 ./HalCode9000.x --agent ", worker_spec)
+                cmd_prefix = StringConcat(cmd_prefix, " < ")
 
                 c_data = ""
                 IfCondition NotEqual(c_key, 0) ThenBlock: {
@@ -249,7 +320,7 @@ Function.Agent_HandleRequest {
                     argv = Allocate(32)
                     StoreValue(Add(argv, 0), "/bin/sh")
                     StoreValue(Add(argv, 8), "-c")
-                    cmd = "timeout 300 ./HalCode9000.x --agent deepseek < "
+                    cmd = cmd_prefix
                     cmd = StringConcat(cmd, in_path)
                     cmd = StringConcat(cmd, " > ")
                     cmd = StringConcat(cmd, out_path)

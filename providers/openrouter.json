@@ -10,6 +10,86 @@
   "tier": 1,
   "models": [
     {
+      "id": "x-ai/grok-4.7",
+      "display": "SpaceXAI: Grok 4.7"
+    },
+    {
+      "id": "prism-ml/ternary-bonsai-2-27b",
+      "display": "PrismML: Ternary Bonsai 2 27B"
+    },
+    {
+      "id": "z-ai/glm-5.3-flashx",
+      "display": "Z.ai: GLM 5.3 FlashX"
+    },
+    {
+      "id": "unbiased/pareto",
+      "display": "Pareto"
+    },
+    {
+      "id": "~deepseek/deepseek-pro-latest",
+      "display": "DeepSeek: DeepSeek Pro Latest"
+    },
+    {
+      "id": "~deepseek/deepseek-flash-latest",
+      "display": "DeepSeek: DeepSeek Flash Latest"
+    },
+    {
+      "id": "inference-net/schematron-v2-turbo",
+      "display": "Inference.net: Schematron V2 Turbo"
+    },
+    {
+      "id": "inference-net/schematron-v2-small",
+      "display": "Inference.net: Schematron V2 Small"
+    },
+    {
+      "id": "~openai/gpt-astra-latest",
+      "display": "OpenAI: GPT Astra Latest"
+    },
+    {
+      "id": "~openai/gpt-sol-latest",
+      "display": "OpenAI: GPT Sol Latest"
+    },
+    {
+      "id": "~openai/gpt-terra-latest",
+      "display": "OpenAI: GPT Terra Latest"
+    },
+    {
+      "id": "~openai/gpt-luna-latest",
+      "display": "OpenAI: GPT Luna Latest"
+    },
+    {
+      "id": "sakana/fugu-ultra-v2",
+      "display": "Sakana: Fugu Ultra v2"
+    },
+    {
+      "id": "sakana/fugu-max",
+      "display": "Sakana: Fugu Max"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash-vl",
+      "display": "inclusionAI: Ling 3.0 Flash VL"
+    },
+    {
+      "id": "inclusionai/ling-3.0-flash-vl:free",
+      "display": "inclusionAI: Ling 3.0 Flash VL (free)"
+    },
+    {
+      "id": "deepseek/deepseek-v4.1-flash",
+      "display": "DeepSeek: DeepSeek V4.1 Flash"
+    },
+    {
+      "id": "inception/mercury-2.5",
+      "display": "Inception: Mercury 2.5"
+    },
+    {
+      "id": "nex-agi/nex-n2.5-mini:free",
+      "display": "Nex AGI: Nex-N2.5-Mini (free)"
+    },
+    {
+      "id": "nex-agi/nex-n2.5-pro:free",
+      "display": "Nex AGI: Nex-N2.5-Pro (free)"
+    },
+    {
       "id": "openai/gpt-6-astra",
       "display": "OpenAI: GPT-6 Astra"
     },
@@ -58,10 +138,6 @@
       "display": "Anthropic: Claude Fable 5.1 (batch)"
     },
     {
-      "id": "inception/mercury-2.5-preview",
-      "display": "Inception: Mercury 2.5 Preview"
-    },
-    {
       "id": "ibm-granite/granite-4.2-8b",
       "display": "IBM: Granite 4.2 8B"
     },
@@ -102,6 +178,10 @@
       "display": "DeepSeek: DeepSeek V4 Flash Vision Exp"
     },
     {
+      "id": "deepseek/deepseek-v4-flash-vision-exp:batch",
+      "display": "DeepSeek: DeepSeek V4 Flash Vision Exp (batch)"
+    },
+    {
       "id": "tencent/hy-mt2-1.8b",
       "display": "Tencent: Hy-MT2-1.8B"
     },
@@ -122,8 +202,16 @@
       "display": "Z.ai: GLM 5.3"
     },
     {
+      "id": "z-ai/glm-5.3:batch",
+      "display": "Z.ai: GLM 5.3 (batch)"
+    },
+    {
       "id": "qwen/qwen3.8-27b",
       "display": "Qwen: Qwen3.8 27B"
+    },
+    {
+      "id": "qwen/qwen3.8-27b:free",
+      "display": "Qwen: Qwen3.8 27B (free)"
     },
     {
       "id": "dots-studio/dots-3-note-preview:free",
@@ -144,10 +232,6 @@
     {
       "id": "qwen/qwen3.8-2.4t-a95b",
       "display": "Qwen: Qwen3.8 2.4T A95B"
-    },
-    {
-      "id": "qwen/qwen3.8-2.4t-a95b:batch",
-      "display": "Qwen: Qwen3.8 2.4T A95B (batch)"
     },
     {
       "id": "bytedance-seed/seed-2.0-code",
@@ -199,7 +283,7 @@
     },
     {
       "id": "~deepseek/deepseek-v4-flash-latest",
-      "display": "DeepSeek V4 Flash Latest"
+      "display": "DeepSeek: DeepSeek V4 Flash Latest"
     },
     {
       "id": "deepseek/deepseek-v4-flash-0731",
@@ -214,10 +298,6 @@
       "display": "Thinking Machines: Inkling Small"
     },
     {
-      "id": "thinkingmachines/inkling-small:batch",
-      "display": "Thinking Machines: Inkling Small (batch)"
-    },
-    {
       "id": "thinkingmachines/inkling-small:free",
       "display": "Thinking Machines: Inkling Small (free)"
     },
@@ -227,11 +307,11 @@
     },
     {
       "id": "anthropic/claude-opus-5",
-      "display": "Claude Opus 5"
+      "display": "Anthropic: Claude Opus 5"
     },
     {
       "id": "anthropic/claude-opus-5:batch",
-      "display": "Claude Opus 5 (batch)"
+      "display": "Anthropic: Claude Opus 5 (batch)"
     },
     {
       "id": "inclusionai/ling-3.0-flash",
@@ -270,10 +350,6 @@
       "display": "Thinking Machines: Inkling"
     },
     {
-      "id": "thinkingmachines/inkling:batch",
-      "display": "Thinking Machines: Inkling (batch)"
-    },
-    {
       "id": "thinkingmachines/inkling:free",
       "display": "Thinking Machines: Inkling (free)"
     },
@@ -284,10 +360,6 @@
     {
       "id": "moonshotai/kimi-k3",
       "display": "MoonshotAI: Kimi K3"
-    },
-    {
-      "id": "moonshotai/kimi-k3:batch",
-      "display": "MoonshotAI: Kimi K3 (batch)"
     },
     {
       "id": "meta/muse-spark-1.1",
@@ -386,10 +458,6 @@
       "display": "Google: Nano Banana 2 Lite (Gemini 3.1 Flash Lite Image)"
     },
     {
-      "id": "nex-agi/nex-n2-mini",
-      "display": "Nex AGI: Nex-N2-Mini"
-    },
-    {
       "id": "sakana/fugu-ultra",
       "display": "Sakana: Fugu Ultra"
     },
@@ -410,6 +478,14 @@
       "display": "Z.ai: GLM 5.2"
     },
     {
+      "id": "z-ai/glm-5.2:batch",
+      "display": "Z.ai: GLM 5.2 (batch)"
+    },
+    {
+      "id": "z-ai/glm-5.2:free",
+      "display": "Z.ai: GLM 5.2 (free)"
+    },
+    {
       "id": "openrouter/fusion",
       "display": "OpenRouter: Fusion"
     },
@@ -428,10 +504,6 @@
     {
       "id": "anthropic/claude-fable-5:batch",
       "display": "Anthropic: Claude Fable 5 (batch)"
-    },
-    {
-      "id": "nex-agi/nex-n2-pro",
-      "display": "Nex AGI: Nex-N2-Pro"
     },
     {
       "id": "nvidia/nemotron-3.5-content-safety",
@@ -456,14 +528,6 @@
     {
       "id": "minimax/minimax-m3",
       "display": "MiniMax: MiniMax M3"
-    },
-    {
-      "id": "minimax/minimax-m3:batch",
-      "display": "MiniMax: MiniMax M3 (batch)"
-    },
-    {
-      "id": "minimax/minimax-m3:free",
-      "display": "MiniMax: MiniMax M3 (free)"
     },
     {
       "id": "stepfun/step-3.7-flash",
@@ -531,31 +595,27 @@
     },
     {
       "id": "~anthropic/claude-haiku-latest",
-      "display": "Anthropic Claude Haiku Latest"
+      "display": "Anthropic: Claude Haiku Latest"
     },
     {
       "id": "~openai/gpt-mini-latest",
-      "display": "OpenAI GPT Mini Latest"
+      "display": "OpenAI: GPT Mini Latest"
     },
     {
       "id": "~google/gemini-pro-latest",
-      "display": "Google Gemini Pro Latest"
+      "display": "Google: Gemini Pro Latest"
     },
     {
       "id": "~moonshotai/kimi-latest",
-      "display": "MoonshotAI Kimi Latest"
+      "display": "MoonshotAI: Kimi Latest"
     },
     {
       "id": "~google/gemini-flash-latest",
-      "display": "Google Gemini Flash Latest"
+      "display": "Google: Gemini Flash Latest"
     },
     {
       "id": "~anthropic/claude-sonnet-latest",
-      "display": "Anthropic Claude Sonnet Latest"
-    },
-    {
-      "id": "~openai/gpt-latest",
-      "display": "OpenAI GPT Latest"
+      "display": "Anthropic: Claude Sonnet Latest"
     },
     {
       "id": "qwen/qwen3.5-plus-20260420",
@@ -654,10 +714,6 @@
       "display": "Google: Gemma 4 31B"
     },
     {
-      "id": "google/gemma-4-31b-it:batch",
-      "display": "Google: Gemma 4 31B (batch)"
-    },
-    {
       "id": "google/gemma-4-31b-it:free",
       "display": "Google: Gemma 4 31B (free)"
     },
@@ -702,10 +758,6 @@
       "display": "MiniMax: MiniMax M2.7"
     },
     {
-      "id": "minimax/minimax-m2.7:free",
-      "display": "MiniMax: MiniMax M2.7 (free)"
-    },
-    {
       "id": "openai/gpt-5.4-nano",
       "display": "OpenAI: GPT-5.4 Nano"
     },
@@ -726,6 +778,10 @@
       "display": "Mistral: Mistral Small 4"
     },
     {
+      "id": "mistralai/mistral-small-2603:batch",
+      "display": "Mistral: Mistral Small 4 (batch)"
+    },
+    {
       "id": "z-ai/glm-5-turbo",
       "display": "Z.ai: GLM 5 Turbo"
     },
@@ -744,10 +800,6 @@
     {
       "id": "qwen/qwen3.5-9b",
       "display": "Qwen: Qwen3.5-9B"
-    },
-    {
-      "id": "qwen/qwen3.5-9b:batch",
-      "display": "Qwen: Qwen3.5-9B (batch)"
     },
     {
       "id": "openai/gpt-5.4-pro",
@@ -978,12 +1030,16 @@
       "display": "Mistral: Ministral 3 8B 2512"
     },
     {
+      "id": "mistralai/ministral-8b-2512:batch",
+      "display": "Mistral: Ministral 3 8B 2512 (batch)"
+    },
+    {
       "id": "mistralai/ministral-3b-2512",
       "display": "Mistral: Ministral 3 3B 2512"
     },
     {
-      "id": "mistralai/mistral-large-2512",
-      "display": "Mistral: Mistral Large 3 2512"
+      "id": "mistralai/mistral-large-2512:batch",
+      "display": "Mistral: Mistral Large 3 2512 (batch)"
     },
     {
       "id": "deepseek/deepseek-v3.2",
@@ -1162,10 +1218,6 @@
       "display": "Qwen: Qwen3 30B A3B Thinking 2507"
     },
     {
-      "id": "nousresearch/hermes-4-70b",
-      "display": "Nous: Hermes 4 70B"
-    },
-    {
       "id": "nousresearch/hermes-4-405b",
       "display": "Nous: Hermes 4 405B"
     },
@@ -1176,6 +1228,10 @@
     {
       "id": "mistralai/mistral-medium-3.1",
       "display": "Mistral: Mistral Medium 3.1"
+    },
+    {
+      "id": "mistralai/mistral-medium-3.1:batch",
+      "display": "Mistral: Mistral Medium 3.1 (batch)"
     },
     {
       "id": "z-ai/glm-4.5v",
@@ -1210,16 +1266,8 @@
       "display": "OpenAI: gpt-oss-120b"
     },
     {
-      "id": "openai/gpt-oss-120b:batch",
-      "display": "OpenAI: gpt-oss-120b (batch)"
-    },
-    {
       "id": "openai/gpt-oss-20b",
       "display": "OpenAI: gpt-oss-20b"
-    },
-    {
-      "id": "openai/gpt-oss-20b:batch",
-      "display": "OpenAI: gpt-oss-20b (batch)"
     },
     {
       "id": "anthropic/claude-opus-4.1",
@@ -1232,6 +1280,10 @@
     {
       "id": "mistralai/codestral-2508",
       "display": "Mistral: Codestral 2508"
+    },
+    {
+      "id": "mistralai/codestral-2508:batch",
+      "display": "Mistral: Codestral 2508 (batch)"
     },
     {
       "id": "qwen/qwen3-coder-30b-a3b-instruct",
@@ -1334,20 +1386,12 @@
       "display": "DeepSeek: R1 0528"
     },
     {
-      "id": "anthropic/claude-opus-4",
-      "display": "Anthropic: Claude Opus 4"
-    },
-    {
       "id": "anthropic/claude-sonnet-4",
       "display": "Anthropic: Claude Sonnet 4"
     },
     {
       "id": "mistralai/mistral-medium-3",
       "display": "Mistral: Mistral Medium 3"
-    },
-    {
-      "id": "google/gemini-2.5-pro-preview-05-06",
-      "display": "Google: Gemini 2.5 Pro Preview 05-06"
     },
     {
       "id": "meta-llama/llama-guard-4-12b",
@@ -1688,10 +1732,6 @@
     {
       "id": "openai/gpt-3.5-turbo-0613",
       "display": "OpenAI: GPT-3.5 Turbo (older v0613)"
-    },
-    {
-      "id": "openai/gpt-4-turbo-preview",
-      "display": "OpenAI: GPT-4 Turbo Preview"
     },
     {
       "id": "openrouter/auto",
