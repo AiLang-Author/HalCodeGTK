@@ -325,10 +325,27 @@ Approval flows (order of preference):
 |---|---|
 | 0 | This spec (done, reframed v0.2) |
 | 1 | `--serve` mode: `/healthz`, `/v1/chat` + SSE, single session, reused agent loop |
-| 2 | Sessions: `/v1/sessions/*`, `/v1/tools`, auth |
+| 2 | Sessions: `/v1/sessions/*`, `/v1/tools`, auth — **done** |
 | 3 | Task queue: `/v1/tasks`, coordinator routing, `hc_tasks` wiring |
 | 4 | Driver connector (any backend) + approval callback |
 | 5 | Sandboxing (VM↔host), multi-session/multi-bot coordination, TLS |
+
+### Phase 2 (implemented)
+
+- **Auth** — bearer token. Precedence: `--token <t>` → `HALBOT_SERVE_TOKEN`
+  env → `~/.halcode/keys.env` (`HALBOT_SERVE_TOKEN=...`). If none exist, a
+  token is generated, persisted (mode 0600), and printed once at boot.
+  `/healthz` stays open for liveness; all `/v1/*` routes require
+  `Authorization: Bearer <token>`.
+- **`GET /v1/tools`** — returns `{"tools":[...]}` from the cached
+  `IPCDispatch.GetToolSchemasArray()`.
+- **Sessions** (Pgmem-backed, resumable across `--serve`/TUI/GUI):
+  - `GET /v1/sessions` — list non-deleted sessions.
+  - `GET /v1/sessions/{id}` — snapshot (meta + history + tasks).
+  - `DELETE /v1/sessions/{id}` — soft delete (tombstone meta + cleared history).
+  - `POST /v1/sessions/{id}/messages` — append a message, run a turn (SSE).
+  - `POST /v1/chat` — create a session + run the first turn (SSE), now persists
+    the session and returns the real `session_id`.
 
 ---
 

@@ -88,6 +88,7 @@ FixedPool.CCRunState {
     "ui_thread":     Initialize=0, CanChange=True
     "ui_state":      Initialize=0, CanChange=True
     "fresh":         Initialize=0, CanChange=True
+    "serve_token":   Initialize=0, CanChange=True  // bearer token for --serve mode
 }
 
 // MCP on-demand tool table — stores manifest entries for spawn-per-call dispatch.
@@ -5262,9 +5263,213 @@ Function.CC_Serve_RunAgent {
     }
 }
 
-Function.CC_Serve_HandleChat {
+// ---------------------------------------------------------------------------
+// AUTH — bearer token for --serve mode. Precedence: --token arg -> env
+// HALBOT_SERVE_TOKEN -> ~/.halcode/keys.env (HALBOT_SERVE_TOKEN=...). If none
+// exist, generate one, persist it to ~/.halcode/keys.env (mode 0600), and
+// print it to stdout once at boot so the operator can copy it.
+// ---------------------------------------------------------------------------
+Function.CC_Serve_KeysEnvPath {
+    Output: Address
+    Body: {
+        home = CC_GetEnv("HOME")
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        ReturnValue(StringConcat(home, "/.halcode/keys.env"))
+    }
+}
+
+Function.CC_Serve_ReadKeysEnvToken {
+    Input: path: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(CCSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16384)
+        n = SystemCall(CCSys.SYS_READ, fd, buf, 16383, 0, 0)
+        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 16384)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        name = "HALBOT_SERVE_TOKEN="
+        p = StringIndexOf(buf, name)
+        IfCondition LessThan(p, 0) ThenBlock: {
+            Deallocate(buf, 16384)
+            ReturnValue(0)
+        }
+        val_start = Add(p, StringLength(name))
+        val_end = val_start
+        WhileLoop LessThan(val_end, n) {
+            c = GetByte(buf, val_end)
+            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 10) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 13) ThenBlock: { BreakLoop }
+            val_end = Add(val_end, 1)
+        }
+        len = Subtract(val_end, val_start)
+        IfCondition LessEqual(len, 0) ThenBlock: {
+            Deallocate(buf, 16384)
+            ReturnValue(0)
+        }
+        out = Allocate(Add(len, 1))
+        k = 0
+        WhileLoop LessThan(k, len) {
+            SetByte(out, k, GetByte(buf, Add(val_start, k)))
+            k = Add(k, 1)
+        }
+        SetByte(out, len, 0)
+        Deallocate(buf, 16384)
+        ReturnValue(out)
+    }
+}
+
+Function.CC_Serve_AppendKeysEnv {
+    Input: path: Address
+    Input: line: Address
+    Body: {
+        fd = SystemCall(CCSys.SYS_OPEN, path, 1089, 384, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_WRITE, fd, line, StringLength(line), 0, 0)
+            SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.CC_Serve_GenerateToken {
+    Output: Address
+    Body: {
+        ts = SystemCall(CCSys.SYS_TIME, 0, 0, 0, 0, 0)
+        r1 = CC_RandomUint16()
+        r2 = CC_RandomUint16()
+        r3 = CC_RandomUint16()
+        r4 = CC_RandomUint16()
+        tok = "hb-"
+        tok = StringConcat(tok, NumberToString(ts))
+        tok = StringConcat(tok, "-")
+        tok = StringConcat(tok, NumberToString(r1))
+        tok = StringConcat(tok, NumberToString(r2))
+        tok = StringConcat(tok, NumberToString(r3))
+        tok = StringConcat(tok, NumberToString(r4))
+        ReturnValue(tok)
+    }
+}
+
+Function.CC_Serve_LoadOrCreateToken {
+    Output: Address
+    Body: {
+        t = CC_ReadArgValue("--token")
+        IfCondition NotEqual(t, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: { ReturnValue(t) }
+        }
+        t = CC_GetEnv("HALBOT_SERVE_TOKEN")
+        IfCondition NotEqual(t, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: { ReturnValue(t) }
+        }
+        path = CC_Serve_KeysEnvPath()
+        t = CC_Serve_ReadKeysEnvToken(path)
+        IfCondition NotEqual(t, 0) ThenBlock: { ReturnValue(t) }
+
+        t = CC_Serve_GenerateToken()
+        home = CC_GetEnv("HOME")
+        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
+        haldir = StringConcat(home, "/.halcode")
+        SystemCall(CCSys.SYS_MKDIR, haldir, 448, 0, 0, 0)
+        line = "HALBOT_SERVE_TOKEN="
+        line = StringConcat(line, t)
+        line = StringConcat(line, "\n")
+        CC_Serve_AppendKeysEnv(path, line)
+        ReturnValue(t)
+    }
+}
+
+// Returns 1 if the request carries a matching "Authorization: Bearer <t>".
+// Sends a 401 and returns 0 otherwise. An empty expected token disables auth.
+Function.CC_Serve_CheckAuth {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: expected: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(expected, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition LessEqual(StringLength(expected), 0) ThenBlock: { ReturnValue(1) }
+
+        hdr = StringIndexOf(buf, "Authorization:")
+        IfCondition LessThan(hdr, 0) ThenBlock: {
+            hdr = StringIndexOf(buf, "authorization:")
+        }
+        IfCondition LessThan(hdr, 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"missing authorization header\"}")
+            ReturnValue(0)
+        }
+
+        val_pos = Add(hdr, 14)
+        WhileLoop EqualTo(GetByte(buf, val_pos), 32) {
+            val_pos = Add(val_pos, 1)
+        }
+
+        scheme = StringSubstring(buf, val_pos, Add(val_pos, 7))
+        IfCondition NotEqual(StringCompare(scheme, "Bearer "), 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"unsupported auth scheme\"}")
+            ReturnValue(0)
+        }
+
+        tok_start = Add(val_pos, 7)
+        tok_end = tok_start
+        WhileLoop 1 {
+            c = GetByte(buf, tok_end)
+            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 13) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 10) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 32) ThenBlock: { BreakLoop }
+            tok_end = Add(tok_end, 1)
+        }
+        tok = StringSubstring(buf, tok_start, tok_end)
+        IfCondition NotEqual(StringCompare(tok, expected), 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"invalid token\"}")
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SESSIONS — persisted via Pgmem (session:<sid>:meta + session:<sid>:history),
+// the same keys the TUI/GUI use, so a --serve session is resumable anywhere.
+// ---------------------------------------------------------------------------
+
+// Ensure a session exists (create an empty one if it doesn't). Returns 1.
+Function.CC_Serve_EnsureSession {
+    Input: sid: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sid, 0) ThenBlock: { ReturnValue(0) }
+        m_key = StringConcat("session:", sid)
+        m_key = StringConcat(m_key, ":meta")
+        args = JSON.NewObject()
+        JSON.SetString(args, "op", "pickup")
+        JSON.SetString(args, "key", m_key)
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        resp = IPCDispatch.Dispatch("Pgmem", args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+        IfCondition And(EqualTo(err, 0), NotEqual(resp, 0)) ThenBlock: {
+            IfCondition GreaterThan(StringLength(resp), 0) ThenBlock: { ReturnValue(1) }
+        }
+        History.Clear()
+        History.SetSessionID(sid)
+        History.SetTitle("New Session")
+        CC_SaveSessionToPgmem()
+        ReturnValue(1)
+    }
+}
+
+// Run one chat turn for a session (create a new one if sid==0) and emit SSE.
+Function.CC_Serve_RunChatTurn {
     Input: fd: Integer
     Input: body_ptr: Address
+    Input: sid: Address
     Body: {
         msg = ""
         prov = 0
@@ -5299,7 +5504,16 @@ Function.CC_Serve_HandleChat {
             }
         }
 
-        sid = CC_GenerateSessionGUID()
+        // Decide + persist the session before spawning the worker so the
+        // --agent child resumes exactly this session (CC_GuiApplySession reads
+        // /tmp/halcode_app/session.txt). nopickup.txt suppresses the desktop
+        // working_state recap from being prepended to the prompt.
+        IfCondition EqualTo(sid, 0) ThenBlock: {
+            sid = CC_GenerateSessionGUID()
+        }
+        CC_Serve_EnsureSession(sid)
+        CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
+        CC_WriteAppFile("/tmp/halcode_app/nopickup.txt", sid)
 
         CC_Serve_WriteStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
 
@@ -5320,6 +5534,240 @@ Function.CC_Serve_HandleChat {
         dobj = JSON.NewObject()
         JSON.SetString(dobj, "stop_reason", "end_turn")
         CC_Serve_SendEvent(fd, "turn_done", JSON.SerializeObject(dobj))
+    }
+}
+
+Function.CC_Serve_HandleChat {
+    Input: fd: Integer
+    Input: body_ptr: Address
+    Body: {
+        CC_Serve_RunChatTurn(fd, body_ptr, 0)
+    }
+}
+
+Function.CC_Serve_HandleTools {
+    Input: fd: Integer
+    Body: {
+        schemas = IPCDispatch.GetToolSchemasArray()
+        resp = JSON.NewObject()
+        JSON.SetArray(resp, "tools", schemas)
+        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(resp))
+    }
+}
+
+Function.CC_Serve_HandleSessionsList {
+    Input: fd: Integer
+    Body: {
+        args = JSON.NewObject()
+        JSON.SetString(args, "op", "search")
+        JSON.SetString(args, "query", "session:")
+        JSON.SetString(args, "kind", "session_meta")
+        JSON.SetString(args, "scope", "persistent")
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        resp = IPCDispatch.Dispatch("Pgmem", args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+
+        out = JSON.NewObject()
+        out_arr = JSON.NewArray()
+        IfCondition And(EqualTo(err, 0), NotEqual(resp, 0)) ThenBlock: {
+            parsed = JSON.AsObject(ParseJSON(resp))
+            IfCondition NotEqual(parsed, 0) ThenBlock: {
+                rows = JSON.GetArray(parsed, "rows")
+                IfCondition NotEqual(rows, 0) ThenBlock: {
+                    n_rows = JSON.ArrayLength(rows)
+                    i = 0
+                    WhileLoop LessThan(i, n_rows) {
+                        row = JSON.AsObject(JSON.ArrayGet(rows, i))
+                        IfCondition NotEqual(row, 0) ThenBlock: {
+                            key = JSON.GetString(row, "key")
+                            IfCondition NotEqual(key, 0) ThenBlock: {
+                                klen = StringLength(key)
+                                IfCondition GreaterThan(klen, 5) ThenBlock: {
+                                    sub_pos = Subtract(klen, 5)
+                                    IfCondition EqualTo(StringCompare(Add(key, sub_pos), ":meta"), 0) ThenBlock: {
+                                        content_str = JSON.GetString(row, "content")
+                                        IfCondition NotEqual(content_str, 0) ThenBlock: {
+                                            m_obj = JSON.AsObject(ParseJSON(content_str))
+                                            IfCondition NotEqual(m_obj, 0) ThenBlock: {
+                                                del = JSON.GetString(m_obj, "deleted")
+                                                IfCondition EqualTo(del, 0) ThenBlock: {
+                                                    JSON.PushObject(out_arr, m_obj)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        i = Add(i, 1)
+                    }
+                }
+            }
+        }
+        JSON.SetArray(out, "sessions", out_arr)
+        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(out))
+    }
+}
+
+Function.CC_Serve_HandleSessionGet {
+    Input: fd: Integer
+    Input: sid: Address
+    Body: {
+        m_key = StringConcat("session:", sid)
+        m_key = StringConcat(m_key, ":meta")
+        m_args = JSON.NewObject()
+        JSON.SetString(m_args, "op", "pickup")
+        JSON.SetString(m_args, "key", m_key)
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        m_resp = IPCDispatch.Dispatch("Pgmem", m_args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+        IfCondition Or(EqualTo(err, 1), EqualTo(m_resp, 0)) ThenBlock: {
+            CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"session not found\"}")
+            ReturnValue(0)
+        }
+        meta_obj = JSON.AsObject(ParseJSON(m_resp))
+        IfCondition EqualTo(meta_obj, 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "500 Internal Server Error", "application/json", "{\"ok\":false,\"error\":\"bad meta\"}")
+            ReturnValue(0)
+        }
+        del = JSON.GetString(meta_obj, "deleted")
+        IfCondition NotEqual(del, 0) ThenBlock: {
+            CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"session deleted\"}")
+            ReturnValue(0)
+        }
+
+        h_key = StringConcat("session:", sid)
+        h_key = StringConcat(h_key, ":history")
+        h_args = JSON.NewObject()
+        JSON.SetString(h_args, "op", "pickup")
+        JSON.SetString(h_args, "key", h_key)
+        perr2 = Allocate(8)
+        StoreValue(perr2, 0, "dword")
+        h_resp = IPCDispatch.Dispatch("Pgmem", h_args, 0, perr2)
+        err2 = Dereference(perr2, "dword")
+        Deallocate(perr2, 8)
+        hist_arr = 0
+        IfCondition And(EqualTo(err2, 0), NotEqual(h_resp, 0)) ThenBlock: {
+            hist_arr = JSON.AsArray(ParseJSON(h_resp))
+        }
+        IfCondition EqualTo(hist_arr, 0) ThenBlock: { hist_arr = JSON.NewArray() }
+
+        t_args = JSON.NewObject()
+        JSON.SetString(t_args, "op", "task_list")
+        JSON.SetString(t_args, "session_id", sid)
+        perr3 = Allocate(8)
+        StoreValue(perr3, 0, "dword")
+        t_resp = IPCDispatch.Dispatch("Pgmem", t_args, 0, perr3)
+        err3 = Dereference(perr3, "dword")
+        Deallocate(perr3, 8)
+        tasks_arr = 0
+        IfCondition And(EqualTo(err3, 0), NotEqual(t_resp, 0)) ThenBlock: {
+            t_obj = JSON.AsObject(ParseJSON(t_resp))
+            IfCondition NotEqual(t_obj, 0) ThenBlock: {
+                tasks_arr = JSON.GetArray(t_obj, "tasks")
+            }
+        }
+        IfCondition EqualTo(tasks_arr, 0) ThenBlock: { tasks_arr = JSON.NewArray() }
+
+        JSON.SetArray(meta_obj, "history", hist_arr)
+        JSON.SetArray(meta_obj, "tasks", tasks_arr)
+        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(meta_obj))
+    }
+}
+
+Function.CC_Serve_HandleSessionDelete {
+    Input: fd: Integer
+    Input: sid: Address
+    Body: {
+        del_meta = JSON.NewObject()
+        JSON.SetString(del_meta, "id", sid)
+        JSON.SetString(del_meta, "title", "Deleted Session")
+        JSON.SetString(del_meta, "deleted", "true")
+
+        m_key = StringConcat("session:", sid)
+        m_key = StringConcat(m_key, ":meta")
+        m_args = JSON.NewObject()
+        JSON.SetString(m_args, "op", "park")
+        JSON.SetString(m_args, "key", m_key)
+        JSON.SetString(m_args, "kind", "session_meta")
+        JSON.SetString(m_args, "scope", "persistent")
+        JSON.SetString(m_args, "content", JSON.SerializeObject(del_meta))
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        IPCDispatch.Dispatch("Pgmem", m_args, 0, perr)
+        Deallocate(perr, 8)
+
+        h_key = StringConcat("session:", sid)
+        h_key = StringConcat(h_key, ":history")
+        h_args = JSON.NewObject()
+        JSON.SetString(h_args, "op", "park")
+        JSON.SetString(h_args, "key", h_key)
+        JSON.SetString(h_args, "kind", "session_history")
+        JSON.SetString(h_args, "scope", "persistent")
+        JSON.SetString(h_args, "content", "[]")
+        perr2 = Allocate(8)
+        StoreValue(perr2, 0, "dword")
+        IPCDispatch.Dispatch("Pgmem", h_args, 0, perr2)
+        Deallocate(perr2, 8)
+
+        out = JSON.NewObject()
+        JSON.SetBool(out, "ok", 1)
+        JSON.SetString(out, "deleted", sid)
+        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(out))
+    }
+}
+
+Function.CC_Serve_HandleSessionMessages {
+    Input: fd: Integer
+    Input: body_ptr: Address
+    Input: sid: Address
+    Body: {
+        CC_Serve_RunChatTurn(fd, body_ptr, sid)
+    }
+}
+
+// Parse "/v1/sessions/<id>[/messages]" — copies <id> into out (NUL-terminated).
+Function.CC_Serve_ParseSessionPath {
+    Input: path: Address
+    Input: out: Address
+    Output: Integer
+    Body: {
+        prefix = "/v1/sessions/"
+        IfCondition NotEqual(StringIndexOf(path, prefix), 0) ThenBlock: { ReturnValue(0) }
+        start = 13
+        end = start
+        WhileLoop 1 {
+            c = GetByte(path, end)
+            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
+            IfCondition EqualTo(c, 47) ThenBlock: { BreakLoop }
+            end = Add(end, 1)
+        }
+        id_len = Subtract(end, start)
+        IfCondition LessEqual(id_len, 0) ThenBlock: { ReturnValue(0) }
+        k = 0
+        WhileLoop LessThan(k, id_len) {
+            SetByte(out, k, GetByte(path, Add(start, k)))
+            k = Add(k, 1)
+        }
+        SetByte(out, id_len, 0)
+        ReturnValue(1)
+    }
+}
+
+// 1 if path is "/v1/sessions/<id>/messages", else 0.
+Function.CC_Serve_IsMessagesPath {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(path)
+        IfCondition LessThan(plen, 9) ThenBlock: { ReturnValue(0) }
+        pos = Subtract(plen, 9)
+        IfCondition EqualTo(StringCompare(Add(path, pos), "/messages"), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
     }
 }
 
@@ -5353,20 +5801,65 @@ Function.CC_Serve_HandleClient {
             body_ptr = Add(buf, Add(header_end, 4))
         }
 
-        is_healthz = StringCompare(path, "/healthz")
-        is_chat = StringCompare(path, "/v1/chat")
         is_get = StringCompare(method, "GET")
         is_post = StringCompare(method, "POST")
+        is_delete = StringCompare(method, "DELETE")
 
-        IfCondition And(EqualTo(is_healthz, 0), EqualTo(is_get, 0)) ThenBlock: {
+        // Liveness is unauthenticated; everything else requires the bearer.
+        IfCondition And(EqualTo(StringCompare(path, "/healthz"), 0), EqualTo(is_get, 0)) ThenBlock: {
             CC_Serve_SendResponse(fd, "200 OK", "application/json", "{\"ok\":true}")
-        } ElseBlock: {
-            IfCondition And(EqualTo(is_chat, 0), EqualTo(is_post, 0)) ThenBlock: {
-                CC_Serve_HandleChat(fd, body_ptr)
-            } ElseBlock: {
-                CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"not found\"}")
-            }
+            ReturnValue(0)
         }
+
+        IfCondition EqualTo(CC_Serve_CheckAuth(fd, buf, CCRunState.serve_token), 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        IfCondition And(EqualTo(StringCompare(path, "/v1/tools"), 0), EqualTo(is_get, 0)) ThenBlock: {
+            CC_Serve_HandleTools(fd)
+            ReturnValue(0)
+        }
+
+        IfCondition And(EqualTo(StringCompare(path, "/v1/chat"), 0), EqualTo(is_post, 0)) ThenBlock: {
+            CC_Serve_HandleChat(fd, body_ptr)
+            ReturnValue(0)
+        }
+
+        IfCondition And(EqualTo(StringCompare(path, "/v1/sessions"), 0), EqualTo(is_get, 0)) ThenBlock: {
+            CC_Serve_HandleSessionsList(fd)
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(StringIndexOf(path, "/v1/sessions/"), 0) ThenBlock: {
+            sid = Allocate(256)
+            SetByte(sid, 0, 0)
+            IfCondition EqualTo(CC_Serve_ParseSessionPath(path, sid), 1) ThenBlock: {
+                IfCondition EqualTo(CC_Serve_IsMessagesPath(path), 1) ThenBlock: {
+                    IfCondition EqualTo(is_post, 0) ThenBlock: {
+                        CC_Serve_HandleSessionMessages(fd, body_ptr, sid)
+                    } ElseBlock: {
+                        CC_Serve_SendResponse(fd, "405 Method Not Allowed", "application/json", "{\"ok\":false,\"error\":\"use POST\"}")
+                    }
+                } ElseBlock: {
+                    IfCondition EqualTo(is_get, 0) ThenBlock: {
+                        CC_Serve_HandleSessionGet(fd, sid)
+                    } ElseBlock: {
+                        IfCondition EqualTo(is_delete, 0) ThenBlock: {
+                            CC_Serve_HandleSessionDelete(fd, sid)
+                        } ElseBlock: {
+                            CC_Serve_SendResponse(fd, "405 Method Not Allowed", "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}")
+                        }
+                    }
+                }
+            } ElseBlock: {
+                CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"bad session path\"}")
+            }
+            Deallocate(sid, 256)
+            ReturnValue(0)
+        }
+
+        CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"not found\"}")
+        ReturnValue(0)
     }
 }
 
@@ -5380,6 +5873,11 @@ Function.CC_RunServeMode {
         CC_BootTools()
         IPCDispatch.StartProxy()
         CC_RestorePgmemUi(0)
+
+        CCRunState.serve_token = CC_Serve_LoadOrCreateToken()
+        CC_WriteStdout("[serve] bearer token: ")
+        CC_WriteStdout(CCRunState.serve_token)
+        CC_WriteStdout("\n")
 
         port = 8080
         port_str = CC_ReadArgValue("--port")
