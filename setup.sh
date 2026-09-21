@@ -393,7 +393,7 @@ BINS=(
   HalCode9000.x
   cc_read_ipc.x cc_write_ipc.x cc_edit_ipc.x cc_bash_ipc.x
   cc_ls_ipc.x cc_head_ipc.x cc_find_ipc.x cc_grep_ipc.x
-  cc_git_ipc.x cc_webfetch_ipc.x cc_js_ipc.x cc_mcp_ipc.x
+  cc_git_ipc.x cc_webfetch_ipc.x cc_mcp_ipc.x
   cc_agent_ipc.x cc_pgmem_ipc.x cc_relmem_ipc.x
   cc_ailang_lsp_ipc.x
 )

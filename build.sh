@@ -117,12 +117,6 @@ build_app() {
                   "${tmp_prefix}_cc_agent_ipc"
         local_tools+=(agent)
     fi
-    if [[ -f "${tools_dir}/cc_js_ipc.ailang" ]]; then
-        build_one "${tools_dir}/cc_js_ipc.ailang" \
-                  "/tmp/${tmp_prefix}_cc_js_ipc.x" \
-                  "${tmp_prefix}_cc_js_ipc"
-        local_tools+=(js)
-    fi
     if [[ -f "${tools_dir}/cc_mcp_ipc.ailang" ]] && [[ -s "${tools_dir}/cc_mcp_ipc.ailang" ]]; then
         build_one "${tools_dir}/cc_mcp_ipc.ailang" \
                   "/tmp/${tmp_prefix}_cc_mcp_ipc.x" \
@@ -192,4 +186,4 @@ build_app "$ROOT" \
 
 log ""
 log "build.sh: done"
-[[ $COPY -eq 1 && $BUILD_MAIN -eq 1 ]] && log "Run:  cd $ROOT && ./HalCode9000.x"
+[[ $COPY -eq 1 && $BUILD_MAIN -eq 1 ]] && log "Run:  cd $ROOT && ./HalCode9000.x" || true
