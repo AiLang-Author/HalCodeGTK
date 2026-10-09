@@ -207,6 +207,24 @@ Function.CC_GetEnv {
     }
 }
 
+// Heap copy. JSON interior pointers do not survive the auth arena.
+Function.CC_Dup {
+    Input: src: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(src)
+        out = Allocate(Add(n, 1))
+        IfCondition EqualTo(out, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessEqual(i, n) {
+            SetByte(out, i, GetByte(src, i))
+            i = Add(i, 1)
+        }
+        ReturnValue(out)
+    }
+}
+
 Function.CC_SleepMs {
     Input: ms: Integer
     Body: {
@@ -3756,6 +3774,93 @@ Function.CC_ReadStdinAll {
     }
 }
 
+// Match the picker stem to a provider JSON key_hint. Returns 0 when no
+// JSON matches so the caller keeps its hardcoded list. A match always
+// returns a non-zero credential pointer ("" when the provider has no key)
+// and never falls through to Anthropic.
+Function.CC_ProvFromJSON {
+    Input: prov_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(prov_name, 0) ThenBlock: { ReturnValue(0) }
+        all_arr = CC_LoadAllProviderObjects()
+        IfCondition EqualTo(all_arr, 0) ThenBlock: { ReturnValue(0) }
+        sz = Array.Size(all_arr)
+        i = 0
+        found = 0
+        WhileLoop LessThan(i, sz) {
+            pobj = Array.Get(all_arr, i)
+            hint = JSON.GetString(pobj, "key_hint")
+            IfCondition And(NotEqual(hint, 0), EqualTo(StringCompare(hint, prov_name), 0)) ThenBlock: {
+                found = pobj
+                i = sz
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(found, 0) ThenBlock: { ReturnValue(0) }
+        cn0 = JSON.GetString(found, "name")
+        cbk0 = JSON.GetString(found, "backend")
+        curl0 = JSON.GetString(found, "base_url")
+        cap0 = JSON.GetString(found, "api_path")
+        cmdl0 = JSON.GetString(found, "default_model")
+        ckh0 = JSON.GetString(found, "key_hint")
+        cenv0 = JSON.GetString(found, "key_env")
+        creas0 = JSON.GetString(found, "reasoning_effort")
+        cauth0 = JSON.GetString(found, "auth")
+        cn = CC_Dup(cn0)
+        cbk = CC_Dup(cbk0)
+        curl = CC_Dup(curl0)
+        cap = CC_Dup(cap0)
+        cmdl = CC_Dup(cmdl0)
+        ckh = CC_Dup(ckh0)
+        cenv = CC_Dup(cenv0)
+        creas = CC_Dup(creas0)
+        cauth = CC_Dup(cauth0)
+        IfCondition EqualTo(cn, 0) ThenBlock: { cn = "Custom" }
+        IfCondition EqualTo(cbk, 0) ThenBlock: { cbk = "openai" }
+        ElseBlock: {
+            IfCondition EqualTo(StringLength(cbk), 0) ThenBlock: { cbk = "openai" }
+        }
+        IfCondition EqualTo(curl, 0) ThenBlock: { curl = "" }
+        IfCondition EqualTo(cap, 0) ThenBlock: { cap = "/v1/chat/completions" }
+        IfCondition EqualTo(cmdl, 0) ThenBlock: { cmdl = "" }
+        IfCondition EqualTo(ckh, 0) ThenBlock: { ckh = prov_name }
+        CC_MakeProvider(cn, cbk, curl, cap, cmdl, ckh)
+        IfCondition NotEqual(creas, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(creas), 0) ThenBlock: {
+                SelectedProvider.reasoning_effort = creas
+            }
+        }
+        IfCondition NotEqual(cauth, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(cauth, "none"), 0) ThenBlock: {
+                ReturnValue("")
+            }
+        }
+        env_key = 0
+        IfCondition NotEqual(cenv, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(cenv), 0) ThenBlock: {
+                env_key = CC_GetEnv(cenv)
+            }
+        }
+        auth_res = Auth.RunAPIKeyFlow(env_key, ckh)
+        auth_status = 0
+        IfCondition NotEqual(auth_res, 0) ThenBlock: {
+            auth_status = JSON.GetString(auth_res, "status")
+        }
+        IfCondition NotEqual(auth_status, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(auth_status, "ok"), 0) ThenBlock: {
+                got = CC_Dup(JSON.GetString(auth_res, "credential"))
+                IfCondition NotEqual(got, 0) ThenBlock: {
+                    IfCondition GreaterThan(StringLength(got), 0) ThenBlock: {
+                        ReturnValue(got)
+                    }
+                }
+            }
+        }
+        ReturnValue("")
+    }
+}
+
 // Parse "provider[:model]" spec, call CC_MakeProvider, look up the API key.
 // Returns the credential string (heap copy from env, or "" for local).
 Function.CC_SetupAgentProvider {
@@ -3787,7 +3892,8 @@ Function.CC_SetupAgentProvider {
             prov_name = prov_buf
         }
 
-        cred = 0
+        cred = CC_ProvFromJSON(prov_name)
+        IfCondition EqualTo(cred, 0) ThenBlock: {
         matched = 0
 
         IfCondition EqualTo(StringCompare(prov_name, "anthropic"), 0) ThenBlock: {
@@ -3830,6 +3936,7 @@ Function.CC_SetupAgentProvider {
             CC_MakeProvider("Anthropic", "anthropic", "https://api.anthropic.com",
                             "/v1/messages", "claude-sonnet-4-6", "anthropic")
             cred = CC_GetEnv("ANTHROPIC_API_KEY")
+        }
         }
 
         IfCondition NotEqual(model_override, 0) ThenBlock: {

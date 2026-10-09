@@ -223,6 +223,10 @@ add_openai("xiaomi", "Xiaomi", "https://api.xiaomimimo.com/v1", "XIAOMI_API_KEY"
 add_openai("siliconflow", "SiliconFlow", "https://api.siliconflow.com/v1", "SILICONFLOW_API_KEY", "siliconflow")
 add_openai("ai21", "AI21", "https://api.ai21.com/studio/v1", "AI21_API_KEY", "ai21")
 add_openai("meta", "Meta", "https://api.meta.ai/v1", "META_MODEL_API_KEY", "meta")
+# SpaceXAI is the xAI API. Keep that row first so "xAI Grok" is visible.
+_XAI = SPECS.pop("xai")
+SPECS = {"xai": _XAI, **SPECS}
+
 SPECS["minimax"] = {
     "name": "MiniMax",
     "backend": "anthropic",
@@ -266,6 +270,22 @@ def load_keys():
         if os.path.isfile(path):
             with open(path, "r", encoding="utf-8") as fh:
                 set_key(std, fh.read().strip())
+    for hint, spec in SPECS.items():
+        stem = spec.get("key_hint") or hint
+        path = os.path.join(hal, stem + "_key")
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                val = fh.read().strip()
+        except OSError:
+            continue
+        if not val:
+            continue
+        set_key(spec.get("key_env") or "", val)
+        alt = spec.get("key_alt") or ""
+        if alt:
+            set_key(alt, val)
 
 
 def api_key_for(spec):

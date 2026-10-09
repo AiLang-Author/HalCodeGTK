@@ -40,6 +40,8 @@ static char path_go[600], path_prompt[600], path_reply[600], path_model[600];
 static pid_t g_agent = -1;
 static pid_t g_host = -1;
 static pid_t g_prov = -1;
+static pid_t g_key = -1;
+static time_t g_key_next;
 static time_t g_agent_t0;
 static time_t g_agent_prog;
 static time_t g_agent_term;
@@ -48,6 +50,7 @@ static time_t g_host_t0;
 static time_t g_go_wait;
 static char g_app_root[512];
 static char path_fetch_providers[600];
+static char path_save_key[600];
 static FILE *g_dbg;
 static int g_tickn;
 static int g_quitting;
@@ -555,6 +558,9 @@ static gboolean poll_tick(gpointer data) {
         dbg("fetch_providers.py");
         g_prov = fork();
         if (g_prov == 0) {
+            /* A desktop PYTHONHOME (oss-cad-suite) breaks /usr/bin/python3. */
+            unsetenv("PYTHONHOME");
+            unsetenv("PYTHONPATH");
             execl("/usr/bin/python3", "python3",
                 path_fetch_providers,
                 (char *)NULL);
@@ -562,6 +568,29 @@ static gboolean poll_tick(gpointer data) {
         }
         if (g_prov < 0)
             g_prov = -1;
+    }
+    if (g_key > 0) {
+        int st;
+        if (waitpid(g_key, &st, WNOHANG) == g_key) {
+            dbg("save key exit %d", st);
+            if (st != 0)
+                g_key_next = time(NULL) + 2;
+            g_key = -1;
+        }
+    } else if (g_key_next <= time(NULL) &&
+               access("/tmp/halcode_app/keysave.txt", F_OK) == 0) {
+        dbg("save_provider_key.py");
+        g_key = fork();
+        if (g_key == 0) {
+            unsetenv("PYTHONHOME");
+            unsetenv("PYTHONPATH");
+            execl("/usr/bin/python3", "python3",
+                path_save_key,
+                (char *)NULL);
+            _exit(127);
+        }
+        if (g_key < 0)
+            g_key = -1;
     }
     {
         FILE *cf;
@@ -876,6 +905,10 @@ static gboolean on_key(GtkWidget *w, GdkEventKey *e, gpointer data) {
         write_line(path_keys, "T");
         return TRUE;
     }
+    if (e->keyval == GDK_KEY_Escape) {
+        write_line(path_keys, "e");
+        return TRUE;
+    }
     u = gdk_keyval_to_unicode(e->keyval);
     if (u >= 32 && u < 127) {
         snprintf(buf, sizeof buf, "c %u", (unsigned)u);
@@ -911,6 +944,8 @@ int main(int argc, char **argv) {
     resolve_app_root();
     snprintf(path_fetch_providers, sizeof path_fetch_providers,
         "%s/scripts/fetch_providers.py", g_app_root);
+    snprintf(path_save_key, sizeof path_save_key,
+        "%s/scripts/save_provider_key.py", g_app_root);
     paths_init(dir);
     mkdir(dir, 0755);
     unlink("/tmp/halcode_app/ready.txt");
@@ -924,6 +959,9 @@ int main(int argc, char **argv) {
     unlink("/tmp/halcode_app/think.seen");
     unlink("/tmp/halcode_app/copy.txt");
     unlink("/tmp/halcode_app/paste.txt");
+    unlink("/tmp/halcode_app/keysave.txt");
+    unlink("/tmp/halcode_app/keysave.txt.run");
+    unlink("/tmp/halcode_app/keyresult.txt");
     {
         FILE *lf = fopen("/tmp/halcode_gtk.pid", "r");
         pid_t old = 0;
