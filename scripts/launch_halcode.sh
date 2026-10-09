@@ -26,6 +26,9 @@ fi
 
 mkdir -p "$STATE"
 echo "---- $(date -Iseconds) launch_halcode ----" >> "$LOG"
+if [[ -f "$ROOT/providers/picker.txt" ]]; then
+    cp -f "$ROOT/providers/picker.txt" "$STATE/picker.txt"
+fi
 
 # Exact /proc comm only. Never -f (would catch HalCode9000.x --mcp).
 # Linux comm is 15 chars: halcode_shell_gtk → halcode_shell_g

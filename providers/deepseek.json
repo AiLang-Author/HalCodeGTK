@@ -10,26 +10,16 @@
   "tier": 1,
   "models": [
     {
+      "id": "deepseek-flash",
+      "display": "DeepSeek-V4.1-Flash"
+    },
+    {
       "id": "deepseek-v4-pro",
-      "display": "DeepSeek V4 Pro (thinking)"
-    },
-    {
-      "id": "deepseek-v4-flash",
-      "display": "DeepSeek V4 Flash (fast)"
-    },
-    {
-      "id": "deepseek-v4-flash-vision-exp",
-      "display": "DeepSeek V4 Vision (exp)"
-    },
-    {
-      "id": "deepseek-chat",
-      "display": "DeepSeek V3 (chat, legacy)"
-    },
-    {
-      "id": "deepseek-reasoner",
-      "display": "DeepSeek R1 (reasoner, legacy)"
+      "display": "DeepSeek-V4-Pro"
     }
   ],
   "default_model": "deepseek-v4-pro",
+  "source": "live",
+  "fetched_at": "2026-10-09T19:08:56Z",
   "reasoning_effort": "medium"
 }

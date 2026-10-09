@@ -4133,21 +4133,11 @@ Function.CC_RestorePgmemUi {
     }
 }
 
-// Wipe the persistent "where we were" cache so a NEW chat cannot recap the last thread.
+// Drop in-memory handoff only. Parked sessions and working_state stay readable.
 Function.CC_ClearHotCache {
     Body: {
         CCRunState.ui_state = 0
         CCRunState.fresh = 1
-        args = JSON.NewObject()
-        JSON.SetString(args, "op", "park")
-        JSON.SetString(args, "key", "working_state")
-        JSON.SetString(args, "kind", "note")
-        JSON.SetString(args, "scope", "persistent")
-        JSON.SetString(args, "content", "NEW_SESSION. No prior task. Do not recap parked state. Answer only the current user message.")
-        perr = Allocate(8)
-        StoreValue(perr, 0, "dword")
-        IPCDispatch.Dispatch("Pgmem", args, 0, perr)
-        Deallocate(perr, 8)
     }
 }
 
@@ -4177,8 +4167,9 @@ Function.CC_SessionIsFresh {
     }
 }
 
-// GUI --agent is a new process each turn. Resume the same pgmem session the
-// TUI would: session.txt "new" starts clean, a sess-* id loads, else last.
+// GUI --agent is a new process each turn. session.txt "new" or empty starts
+// clean. "last" resumes the previous session. Any other value is a selected id.
+// Never fall back to sessions:last when nothing was selected.
 Function.CC_GuiApplySession {
     Output: Integer
     Body: {
@@ -4186,26 +4177,26 @@ Function.CC_GuiApplySession {
         buf = Allocate(128)
         n = CC_ReadAppFile("/tmp/halcode_app/session.txt", buf, 128)
         is_last = 0
+        is_new = 1
         IfCondition GreaterThan(n, 0) ThenBlock: {
+            is_new = 0
             IfCondition EqualTo(StringCompare(buf, "last"), 0) ThenBlock: { is_last = 1 }
+            IfCondition EqualTo(StringCompare(buf, "new"), 0) ThenBlock: { is_new = 1 }
         }
         IfCondition EqualTo(is_last, 1) ThenBlock: {
             SystemCall(87, "/tmp/halcode_app/nopickup.txt", 0, 0, 0, 0)
-            n = 0
+            loaded = CC_ResumeLastSession()
+            IfCondition EqualTo(loaded, 1) ThenBlock: {
+                sid = History.GetSessionID()
+                IfCondition NotEqual(sid, 0) ThenBlock: {
+                    CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
+                }
+                Deallocate(buf, 128)
+                ReturnValue(1)
+            }
+            is_new = 1
         }
-        IfCondition And(GreaterThan(n, 0), EqualTo(StringCompare(buf, "new"), 0)) ThenBlock: {
-            guid = CC_GenerateSessionGUID()
-            History.Clear()
-            History.SetSessionID(guid)
-            History.SetTitle("New Session")
-            CC_ClearHotCache()
-            CC_MarkNoPickup(guid)
-            CC_SaveSessionToPgmem()
-            CC_WriteAppFile("/tmp/halcode_app/session.txt", guid)
-            Deallocate(buf, 128)
-            ReturnValue(0)
-        }
-        IfCondition GreaterThan(n, 0) ThenBlock: {
+        IfCondition EqualTo(is_new, 0) ThenBlock: {
             ok = CC_LoadSessionFromPgmem(buf)
             IfCondition EqualTo(ok, 1) ThenBlock: {
                 IfCondition EqualTo(CC_SessionIsFresh(buf), 1) ThenBlock: {
@@ -4215,25 +4206,16 @@ Function.CC_GuiApplySession {
                 ReturnValue(1)
             }
         }
+        guid = CC_GenerateSessionGUID()
+        History.Clear()
+        History.SetSessionID(guid)
+        History.SetTitle("New Session")
+        CC_ClearHotCache()
+        CC_MarkNoPickup(guid)
+        CC_SaveSessionToPgmem()
+        CC_WriteAppFile("/tmp/halcode_app/session.txt", guid)
         Deallocate(buf, 128)
-        loaded = CC_ResumeLastSession()
-        IfCondition EqualTo(loaded, 0) ThenBlock: {
-            guid2 = CC_GenerateSessionGUID()
-            History.SetSessionID(guid2)
-            History.SetTitle("New Session")
-            CC_ClearHotCache()
-            CC_MarkNoPickup(guid2)
-            CC_WriteAppFile("/tmp/halcode_app/session.txt", guid2)
-            ReturnValue(0)
-        }
-        sid = History.GetSessionID()
-        IfCondition NotEqual(sid, 0) ThenBlock: {
-            CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
-            IfCondition EqualTo(CC_SessionIsFresh(sid), 1) ThenBlock: {
-                CCRunState.fresh = 1
-            }
-        }
-        ReturnValue(1)
+        ReturnValue(0)
     }
 }
 
@@ -4296,6 +4278,190 @@ Function.CC_AgentLog {
     }
 }
 
+Function.CC_FinishDirectReply {
+    Input: text: Address
+    Body: {
+        IfCondition EqualTo(text, 0) ThenBlock: { text = "" }
+        CC_WriteAppFile("/tmp/halcode_app/reply.tmp", text)
+        SystemCall(CCSys.SYS_RENAME, "/tmp/halcode_app/reply.tmp", "/tmp/halcode_app/reply.txt", 0, 0, 0)
+        CC_WriteStdout(text)
+        CC_WriteStdout("\n")
+    }
+}
+
+Function.CC_FormatSessionList {
+    Output: Address
+    Body: {
+        out = "Sessions (none loaded until you select one):\n"
+        s_args = JSON.NewObject()
+        JSON.SetString(s_args, "op", "search")
+        JSON.SetString(s_args, "query", "session:")
+        JSON.SetString(s_args, "kind", "session_meta")
+        JSON.SetString(s_args, "scope", "persistent")
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        resp = IPCDispatch.Dispatch("Pgmem", s_args, 0, perr)
+        err = Dereference(perr, "dword")
+        Deallocate(perr, 8)
+        IfCondition EqualTo(err, 1) ThenBlock: {
+            ReturnValue("Sessions unavailable (pgmem not attached).")
+        }
+        IfCondition EqualTo(resp, 0) ThenBlock: {
+            ReturnValue(StringConcat(out, "(none)\n"))
+        }
+        parsed = JSON.AsObject(ParseJSON(resp))
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            ReturnValue(StringConcat(out, "(none)\n"))
+        }
+        rows = JSON.GetArray(parsed, "rows")
+        IfCondition EqualTo(rows, 0) ThenBlock: {
+            ReturnValue(StringConcat(out, "(none)\n"))
+        }
+        n_rows = JSON.ArrayLength(rows)
+        written = 0
+        i = 0
+        WhileLoop And(LessThan(i, n_rows), LessThan(written, 20)) {
+            row = JSON.AsObject(JSON.ArrayGet(rows, i))
+            IfCondition NotEqual(row, 0) ThenBlock: {
+                key = JSON.GetString(row, "key")
+                is_meta = 0
+                IfCondition NotEqual(key, 0) ThenBlock: {
+                    klen = StringLength(key)
+                    IfCondition GreaterThan(klen, 5) ThenBlock: {
+                        sub_pos = Subtract(klen, 5)
+                        IfCondition EqualTo(StringCompare(Add(key, sub_pos), ":meta"), 0) ThenBlock: { is_meta = 1 }
+                    }
+                }
+                IfCondition EqualTo(is_meta, 1) ThenBlock: {
+                    content_str = JSON.GetString(row, "content")
+                    IfCondition NotEqual(content_str, 0) ThenBlock: {
+                        m_obj = JSON.AsObject(ParseJSON(content_str))
+                        IfCondition NotEqual(m_obj, 0) ThenBlock: {
+                            del = JSON.GetString(m_obj, "deleted")
+                            IfCondition EqualTo(del, 0) ThenBlock: {
+                                sid = JSON.GetString(m_obj, "id")
+                                title = JSON.GetString(m_obj, "title")
+                                IfCondition EqualTo(sid, 0) ThenBlock: { sid = "" }
+                                IfCondition EqualTo(title, 0) ThenBlock: { title = "Untitled" }
+                                IfCondition GreaterThan(StringLength(sid), 0) ThenBlock: {
+                                    out = StringConcat(out, sid)
+                                    out = StringConcat(out, "  ")
+                                    out = StringConcat(out, title)
+                                    out = StringConcat(out, "\n")
+                                    written = Add(written, 1)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(written, 0) ThenBlock: {
+            out = StringConcat(out, "(none)\n")
+        }
+        out = StringConcat(out, "Read: /read <id>    Reopen: /resume <id>    New: /new\n")
+        ReturnValue(out)
+    }
+}
+
+// Slash commands that touch the session store without calling the model.
+// Natural-language reads go through Pgmem; these are the explicit selectors.
+Function.CC_TrySessionCmd {
+    Input: prompt: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(prompt, 0) ThenBlock: { ReturnValue(0) }
+        ntrim = StringLength(prompt)
+        WhileLoop GreaterThan(ntrim, 0) {
+            ctrim = GetByte(prompt, Subtract(ntrim, 1))
+            IfCondition Or(EqualTo(ctrim, 10), EqualTo(ctrim, 13)) ThenBlock: {
+                ntrim = Subtract(ntrim, 1)
+                SetByte(prompt, ntrim, 0)
+            } ElseBlock: { BreakLoop }
+        }
+        IfCondition EqualTo(StringCompare(prompt, "/sessions"), 0) ThenBlock: {
+            CC_FinishDirectReply(CC_FormatSessionList())
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(StringCompare(prompt, "/new"), 0) ThenBlock: {
+            guid = CC_GenerateSessionGUID()
+            History.Clear()
+            History.SetSessionID(guid)
+            History.SetTitle("New Session")
+            CC_ClearHotCache()
+            CC_MarkNoPickup(guid)
+            CC_SaveSessionToPgmem()
+            CC_WriteAppFile("/tmp/halcode_app/session.txt", guid)
+            msg = StringConcat("New session ", guid)
+            msg = StringConcat(msg, ". Prior sessions were not loaded.")
+            CC_FinishDirectReply(msg)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(StringCompare(prompt, "/resume"), 0) ThenBlock: {
+            loaded = CC_ResumeLastSession()
+            IfCondition EqualTo(loaded, 1) ThenBlock: {
+                sid = History.GetSessionID()
+                IfCondition NotEqual(sid, 0) ThenBlock: {
+                    CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
+                }
+                SystemCall(87, "/tmp/halcode_app/nopickup.txt", 0, 0, 0, 0)
+                CCRunState.fresh = 0
+                CC_SaveSessionToPgmem()
+                msg = StringConcat("Reopened last session ", sid)
+                CC_FinishDirectReply(msg)
+            } ElseBlock: {
+                CC_FinishDirectReply("No last session to reopen.")
+            }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(CC_StartsWith(prompt, "/resume "), 1) ThenBlock: {
+            sid = Add(prompt, 8)
+            ok = CC_LoadSessionFromPgmem(sid)
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
+                SystemCall(87, "/tmp/halcode_app/nopickup.txt", 0, 0, 0, 0)
+                CCRunState.fresh = 0
+                CC_SaveSessionToPgmem()
+                msg = StringConcat("Reopened session ", sid)
+                CC_FinishDirectReply(msg)
+            } ElseBlock: {
+                msg = StringConcat("Session not found: ", sid)
+                CC_FinishDirectReply(msg)
+            }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(CC_StartsWith(prompt, "/read "), 1) ThenBlock: {
+            sid = Add(prompt, 6)
+            hkey = StringConcat("session:", sid)
+            hkey = StringConcat(hkey, ":history")
+            mkey = StringConcat("session:", sid)
+            mkey = StringConcat(mkey, ":meta")
+            meta = CC_PgmemPickupKey(mkey)
+            hist = CC_PgmemPickupKey(hkey)
+            IfCondition EqualTo(hist, 0) ThenBlock: {
+                msg = StringConcat("No history for ", sid)
+                CC_FinishDirectReply(msg)
+                ReturnValue(1)
+            }
+            body = hist
+            IfCondition GreaterThan(StringLength(hist), 4000) ThenBlock: {
+                body = StringSubstring(hist, 0, 4000)
+                body = StringConcat(body, "\n...[truncated]")
+            }
+            IfCondition EqualTo(meta, 0) ThenBlock: { meta = "" }
+            msg = StringConcat("session ", sid)
+            msg = StringConcat(msg, " meta: ")
+            msg = StringConcat(msg, meta)
+            msg = StringConcat(msg, "\nhistory:\n")
+            msg = StringConcat(msg, body)
+            CC_FinishDirectReply(msg)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
 // Headless agentic loop: redirect fd 1 to /dev/null, init TUI (escape seqs
 // discarded, raw-mode ioctl fails silently on pipe), loop CC_RunTurn until the
 // model stops requesting tools (same keep_going logic as CC_ChatLoop), restore
@@ -4317,26 +4483,7 @@ Function.CC_RunAgentMode {
         CC_AgentLog("[worker] UI.Init")
         UI.Init()
         CC_AgentLog("[worker] appending prompt to history")
-        user_prompt = prompt
-        IfCondition And(EqualTo(CCRunState.fresh, 0), NotEqual(CCRunState.ui_state, 0)) ThenBlock: {
-            skip_ws = 0
-            IfCondition GreaterThan(StringLength(CCRunState.ui_state), 11) ThenBlock: {
-                pfx = Allocate(13)
-                pi = 0
-                WhileLoop LessThan(pi, 12) {
-                    SetByte(pfx, pi, GetByte(CCRunState.ui_state, pi))
-                    pi = Add(pi, 1)
-                }
-                SetByte(pfx, 12, 0)
-                IfCondition EqualTo(StringCompare(pfx, "NEW_SESSION."), 0) ThenBlock: { skip_ws = 1 }
-                Deallocate(pfx, 13)
-            }
-            IfCondition EqualTo(skip_ws, 0) ThenBlock: {
-                head = StringConcat(CCRunState.ui_state, "\n")
-                user_prompt = StringConcat(head, prompt)
-            }
-        }
-        History.AppendUser(user_prompt)
+        History.AppendUser(prompt)
 
         CC_AgentLog("[worker] CCFan init")
         fan_ok = CCFan_Init()
@@ -5293,7 +5440,36 @@ Function.CC_Serve_ReadKeysEnvToken {
         }
         SetByte(buf, n, 0)
         name = "HALBOT_SERVE_TOKEN="
+        CC_WriteStdout("[dbg] name_literal=[")
+        CC_WriteStdout(name)
+        CC_WriteStdout("]\n")
         p = StringIndexOf(buf, name)
+        CC_WriteStdout("[dbg] n=")
+        CC_WriteStdout(NumberToString(n))
+        CC_WriteStdout(" name_len=")
+        CC_WriteStdout(NumberToString(StringLength(name)))
+        CC_WriteStdout(" p=")
+        CC_WriteStdout(NumberToString(p))
+        CC_WriteStdout("\n")
+        IfCondition GreaterEqual(p, 0) ThenBlock: {
+            ctx_len = 40
+            ctx_end = Add(p, ctx_len)
+            IfCondition GreaterThan(ctx_end, n) ThenBlock: { ctx_end = n }
+            ctx_start = p
+            IfCondition LessThan(ctx_start, 0) ThenBlock: { ctx_start = 0 }
+            ctxlen = Subtract(ctx_end, ctx_start)
+            ctxbuf = Allocate(Add(ctxlen, 1))
+            zz = 0
+            WhileLoop LessThan(zz, ctxlen) {
+                SetByte(ctxbuf, zz, GetByte(buf, Add(ctx_start, zz)))
+                zz = Add(zz, 1)
+            }
+            SetByte(ctxbuf, ctxlen, 0)
+            CC_WriteStdout("[dbg] buf@p..p+40=[")
+            CC_WriteStdout(ctxbuf)
+            CC_WriteStdout("]\n")
+            Deallocate(ctxbuf, Add(ctxlen, 1))
+        }
         IfCondition LessThan(p, 0) ThenBlock: {
             Deallocate(buf, 16384)
             ReturnValue(0)
@@ -5360,16 +5536,35 @@ Function.CC_Serve_LoadOrCreateToken {
     Body: {
         t = CC_ReadArgValue("--token")
         IfCondition NotEqual(t, 0) ThenBlock: {
-            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: { ReturnValue(t) }
+            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: {
+                CC_WriteStdout("[dbg] branch=ARG len=")
+                CC_WriteStdout(NumberToString(StringLength(t)))
+                CC_WriteStdout("\n")
+                ReturnValue(t)
+            }
         }
         t = CC_GetEnv("HALBOT_SERVE_TOKEN")
         IfCondition NotEqual(t, 0) ThenBlock: {
-            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: { ReturnValue(t) }
+            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: {
+                CC_WriteStdout("[dbg] branch=ENV len=")
+                CC_WriteStdout(NumberToString(StringLength(t)))
+                CC_WriteStdout("\n")
+                ReturnValue(t)
+            }
         }
         path = CC_Serve_KeysEnvPath()
+        CC_WriteStdout("[dbg] keys.env path=")
+        CC_WriteStdout(path)
+        CC_WriteStdout("\n")
         t = CC_Serve_ReadKeysEnvToken(path)
-        IfCondition NotEqual(t, 0) ThenBlock: { ReturnValue(t) }
+        IfCondition NotEqual(t, 0) ThenBlock: {
+            CC_WriteStdout("[dbg] branch=FILE len=")
+            CC_WriteStdout(NumberToString(StringLength(t)))
+            CC_WriteStdout("\n")
+            ReturnValue(t)
+        }
 
+        CC_WriteStdout("[dbg] branch=GENERATE\n")
         t = CC_Serve_GenerateToken()
         home = CC_GetEnv("HOME")
         IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
@@ -6064,6 +6259,11 @@ SubRoutine.Main {
         CC_RegisterToolsOnly()
         CC_AgentLog("[init] CC_RestorePgmemUi")
         CC_RestorePgmemUi(0)
+        CC_AgentLog("[init] session command?")
+        IfCondition EqualTo(CC_TrySessionCmd(prompt_buf), 1) ThenBlock: {
+            CC_AgentLog("[init] session command handled")
+            SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+        }
         CC_AgentLog("[init] CC_GuiApplySession")
         CC_GuiApplySession()
         CC_AgentLog("[init] CC_RunAgentMode")

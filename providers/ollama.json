@@ -8,19 +8,9 @@
   "key_env": "OLLAMA_API_KEY",
   "key_hint": "ollama",
   "tier": 1,
-  "models": [
-    {
-      "id": "llama3.2:latest",
-      "display": "Llama 3.2"
-    },
-    {
-      "id": "qwen2.5-coder:latest",
-      "display": "Qwen 2.5 Coder"
-    },
-    {
-      "id": "deepseek-r1:latest",
-      "display": "DeepSeek R1 Local"
-    }
-  ],
-  "default_model": "llama3.2:latest"
+  "models": [],
+  "default_model": "",
+  "source": "unavailable",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "<urlopen error [Errno 111] Connection refused>"
 }

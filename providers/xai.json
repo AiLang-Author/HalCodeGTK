@@ -10,21 +10,40 @@
   "tier": 1,
   "models": [
     {
-      "id": "grok-3",
-      "display": "Grok 3"
+      "id": "grok-4.7",
+      "display": "Grok 4.7"
     },
     {
-      "id": "grok-3-mini",
-      "display": "Grok 3 Mini"
+      "id": "grok-4.6",
+      "display": "Grok 4.6"
     },
     {
-      "id": "grok-2-1212",
-      "display": "Grok 2"
+      "id": "grok-4.5",
+      "display": "Grok 4.5"
     },
     {
-      "id": "grok-2-vision-1212",
-      "display": "Grok 2 Vision"
+      "id": "grok-4.3",
+      "display": "Grok 4.3"
+    },
+    {
+      "id": "grok-build-0.1",
+      "display": "Grok Build 0.1"
+    },
+    {
+      "id": "grok-4.20-0309-reasoning",
+      "display": "Grok 4.20 (Reasoning)"
+    },
+    {
+      "id": "grok-4.20-0309-non-reasoning",
+      "display": "Grok 4.20 (Non-Reasoning)"
+    },
+    {
+      "id": "grok-4.20-multi-agent-0309",
+      "display": "Grok 4.20 Multi-Agent"
     }
   ],
-  "default_model": "grok-3"
+  "default_model": "grok-4.7",
+  "source": "catalog",
+  "fetched_at": "2026-10-09T19:08:56Z",
+  "note": "HTTP Error 403: Forbidden"
 }
