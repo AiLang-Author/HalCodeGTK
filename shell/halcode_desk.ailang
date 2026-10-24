@@ -11,6 +11,7 @@ LibraryImport.Display.Render.Fonts
 LibraryImport.Display.Theme.UIScale
 LibraryImport.Applications.AppDesk
 LibraryImport.Display.UI.InputBar
+LibraryImport.JSON
 
 Function.DebugLog_Push {
     Input: tag: Address
@@ -104,6 +105,13 @@ FixedPool.Desk {
     "wait":   Initialize=0, CanChange=True
     "waiti":  Initialize=-1, CanChange=True
     "wtick":  Initialize=0, CanChange=True
+    "qbuf":   Initialize=0, CanChange=True
+    "qarr":   Initialize=0, CanChange=True
+    "qn":     Initialize=0, CanChange=True
+    "qrng":   Initialize=42, CanChange=True
+    "qstr":   Initialize=0, CanChange=True
+    "qoff":   Initialize=0, CanChange=True
+    "qsec":   Initialize=0, CanChange=True
     "bar":    Initialize=-1, CanChange=True
     "poff":   Initialize=0, CanChange=True
     "pend":   Initialize=0, CanChange=True
@@ -952,6 +960,57 @@ Function.Desk_DoCopy {
     }
 }
 
+// First JSON object in intrusivethoughts.json. The file buffer stays
+// allocated because the quote strings point into it.
+Function.Desk_LoadQuotes {
+    Body: {
+        Desk.fd = SystemCall(2, "./intrusivethoughts.json", 0, 0, 0)
+        IfCondition LessThan(Desk.fd, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qbuf = Allocate(65536)
+        Desk.n = SystemCall(0, Desk.fd, Desk.qbuf, 65535, 0, 0)
+        SystemCall(3, Desk.fd, 0, 0, 0, 0)
+        IfCondition LessEqual(Desk.n, 0) ThenBlock: { ReturnValue(0) }
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Subtract(Desk.n, 3)) {
+            IfCondition EqualTo(GetByte(Desk.qbuf, Desk.i), 125) ThenBlock: {
+                IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 1)), 10) ThenBlock: {
+                    IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 2)), 10) ThenBlock: {
+                        IfCondition EqualTo(GetByte(Desk.qbuf, Add(Desk.i, 3)), 123) ThenBlock: {
+                            SetByte(Desk.qbuf, Add(Desk.i, 1), 0)
+                            Desk.i = Desk.n
+                        }
+                    }
+                }
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.qbuf, Desk.n, 0)
+        Desk.mp = ParseJSON(Desk.qbuf)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.mp = JSON.AsObject(Desk.mp)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qarr = JSON.GetArray(Desk.mp, "main_set")
+        IfCondition EqualTo(Desk.qarr, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qn = JSON.ArrayLength(Desk.qarr)
+        Desk.qrng = SystemCall(201, 0, 0, 0, 0, 0)
+    }
+}
+
+Function.Desk_NextQuote {
+    Body: {
+        IfCondition LessEqual(Desk.qn, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qrng = Add(Multiply(Desk.qrng, 1664525), 1013904223)
+        Desk.n = Desk.qrng
+        IfCondition LessThan(Desk.n, 0) ThenBlock: { Desk.n = Subtract(0, Desk.n) }
+        Desk.n = Modulo(Desk.n, Desk.qn)
+        Desk.mp = JSON.ArrayGet(Desk.qarr, Desk.n)
+        Desk.mp = JSON.AsString(Desk.mp)
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { ReturnValue(0) }
+        Desk.qstr = Desk.mp
+        Desk.qoff = 0
+    }
+}
+
 Function.Desk_DrawThinkLamp {
     Input: x: Integer
     Input: y: Integer
@@ -960,9 +1019,34 @@ Function.Desk_DrawThinkLamp {
         FB_FillRect(x, y, w, 18, FB_RGB(10, 10, 12))
         Desk.n = Add(40, Divide(Multiply(Desk.bv, 180), 1000))
         IfCondition GreaterThan(Desk.n, 220) ThenBlock: { Desk.n = 220 }
-        Desk.x = Add(x, Divide(w, 2))
-        FB_FillCircle(Desk.x, Add(y, 9), 6, FB_RGB(Desk.n, 4, 4))
-        FB_FillCircle(Desk.x, Add(y, 9), 2, FB_RGB(255, 80, 80))
+        FB_FillCircle(Add(x, 12), Add(y, 9), 6, FB_RGB(Desk.n, 4, 4))
+        FB_FillCircle(Add(x, 12), Add(y, 9), 2, FB_RGB(255, 80, 80))
+        Desk.mp = Desk.qstr
+        IfCondition EqualTo(Desk.mp, 0) ThenBlock: { Desk.mp = "HAL thinking" }
+        Desk.slen = StringLength(Desk.mp)
+        IfCondition LessEqual(Desk.slen, 0) ThenBlock: { ReturnValue(0) }
+        Desk.sa = Subtract(w, 32)
+        IfCondition LessThan(Desk.sa, 48) ThenBlock: { Desk.sa = 48 }
+        Desk.li = Divide(Desk.sa, 6)
+        IfCondition LessThan(Desk.li, 8) ThenBlock: { Desk.li = 8 }
+        IfCondition GreaterThan(Desk.li, 200) ThenBlock: { Desk.li = 200 }
+        Desk.oldw = Add(Desk.slen, 5)
+        Desk.wk = Desk.qoff
+        IfCondition LessThan(Desk.wk, 0) ThenBlock: { Desk.wk = 0 }
+        Desk.wk = Modulo(Desk.wk, Desk.oldw)
+        Desk.i = 0
+        WhileLoop LessThan(Desk.i, Desk.li) {
+            Desk.c = Modulo(Add(Desk.wk, Desk.i), Desk.oldw)
+            IfCondition LessThan(Desk.c, Desk.slen) ThenBlock: {
+                SetByte(Desk.wbuf, Desk.i, GetByte(Desk.mp, Desk.c))
+            } ElseBlock: {
+                SetByte(Desk.wbuf, Desk.i, GetByte(" *** ", Subtract(Desk.c, Desk.slen)))
+            }
+            Desk.i = Add(Desk.i, 1)
+        }
+        SetByte(Desk.wbuf, Desk.i, 0)
+        Desk.n = Desk_FitCount(Desk.wbuf, Desk.sa)
+        Desk_DrawTxtN(Add(x, 24), y, Desk.wbuf, Desk.n, FB_RGB(176, 156, 112))
     }
 }
 
@@ -1486,6 +1570,8 @@ Function.Desk_PollWait {
             Desk.bv = 80
             Desk.bdv = 12
             Desk.wtick = 0
+            IfCondition EqualTo(Desk.qstr, 0) ThenBlock: { Desk_NextQuote() }
+            Desk.qsec = SystemCall(201, 0, 0, 0, 0, 0)
             Desk.dirty = 1
             Desk_Dbg("wait on")
         }
@@ -1498,9 +1584,17 @@ Function.Desk_PollWait {
             Desk.bv = 0
             Desk.bdv = 12
         }
+        // One character about every 80ms, a new line from the file every 10s.
+        // The old clock reset itself on the frame it drew, so a phase never moved.
         Desk.wtick = Add(Desk.wtick, 1)
-        IfCondition GreaterEqual(Desk.wtick, 12) ThenBlock: {
+        IfCondition GreaterEqual(Desk.wtick, 5) ThenBlock: {
             Desk.wtick = 0
+            Desk.qoff = Add(Desk.qoff, 1)
+            Desk.n = SystemCall(201, 0, 0, 0, 0, 0)
+            IfCondition GreaterEqual(Subtract(Desk.n, Desk.qsec), 10) ThenBlock: {
+                Desk_NextQuote()
+                Desk.qsec = Desk.n
+            }
             Desk.dirty = 1
         }
     }
@@ -2915,6 +3009,7 @@ SubRoutine.Main {
         FB_FontInit()
         PrintMessage("[desk] FB_FontInit done\n")
         Desk_EnsureIpc()
+        Desk_LoadQuotes()
         PrintMessage("[desk] EnsureIpc done\n")
         InputBar.Init(1048576)
         PrintMessage("[desk] InputBar done\n")

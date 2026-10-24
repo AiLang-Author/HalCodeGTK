@@ -484,6 +484,16 @@ Function.CCFind_HandleRequest {
                 IfCondition GreaterThan(mr, 0) ThenBlock: { CCFindState.max_results = mr }
             }
 
+            // A missing path used to be echoed as a match. Require a directory.
+            probe_flags = BitwiseOr(CCFindSys.O_RDONLY, CCFindSys.O_DIRECTORY)
+            probe_fd = SystemCall(CCFindSys.SYS_OPENAT, CCFindSys.AT_FDCWD, path, probe_flags, 0, 0)
+            IfCondition LessThan(probe_fd, 0) ThenBlock: {
+                CCFind_SendError(client_fd, id, StringConcat("not a directory: ", path))
+                JSON.Free(parsed)
+                ReturnValue(0)
+            }
+            SystemCall(CCFindSys.SYS_CLOSE, probe_fd, 0, 0, 0, 0)
+
             // Run search
             CCFind_ProcessDir(path, 0)
 

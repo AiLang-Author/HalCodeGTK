@@ -88,4 +88,4 @@ Runtime check (after restart): kill a `cc_*_ipc.x` worker and confirm the
 
 ## Next
 
-- Phase 1: `--serve` loopback bind + `/v1/chat` SSE (separate task).
+- Serve mode lives in the HalBot repo, not this tree.

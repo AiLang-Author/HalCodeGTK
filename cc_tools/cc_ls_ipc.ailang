@@ -335,12 +335,27 @@ Function.CCLs_HandleRequest {
             IfCondition EqualTo(content, 0) ThenBlock: {
                 CCLs_SendError(client_fd, id, "fork/exec ls failed (or path blocked)")
             } ElseBlock: {
+                lines = 0
+                seen_nl = 0
+                li = 0
+                llen = StringLength(content)
+                WhileLoop LessThan(li, llen) {
+                    IfCondition EqualTo(GetByte(content, li), 10) ThenBlock: {
+                        IfCondition EqualTo(seen_nl, 1) ThenBlock: { lines = Add(lines, 1) }
+                        seen_nl = 1
+                    }
+                    li = Add(li, 1)
+                }
                 IfCondition EqualTo(truncated, 1) ThenBlock: {
-                    marker = "\n[truncated]"
+                    marker = StringConcat("\n[truncated after ", NumberToString(lines))
+                    marker = StringConcat(marker, " lines]")
                     final = StringConcat(content, marker)
                     CCLs_SendResult(client_fd, id, final, 1)
                 } ElseBlock: {
-                    CCLs_SendResult(client_fd, id, content, 0)
+                    marker = StringConcat("\n[", NumberToString(lines))
+                    marker = StringConcat(marker, " lines]")
+                    final = StringConcat(content, marker)
+                    CCLs_SendResult(client_fd, id, final, 0)
                 }
             }
             ReturnValue(1)

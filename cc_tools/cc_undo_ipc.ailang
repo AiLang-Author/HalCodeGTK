@@ -72,9 +72,10 @@ FixedPool.CCUndoState {
 Function.CCUndo_BuildSchema {
     Output: Address
     Body: {
-        s = UtilArgs_NewSchema("Undo", "Pop or re-apply the edit/write undo stack: restore or redo files changed this session")
-        UtilArgs_AddField(s, "op",    "string", 1, "Operation: undo | redo | list | status | clear", "op")
-        UtilArgs_AddField(s, "steps", "int",    0, "Number of changes to undo (default 1)", "steps")
+        s = UtilArgs_NewSchema("Undo", "Restore Write/Edit changes under a path. op=undo and op=redo require path so another repo on the stack is left alone. Bash redirects are not recorded.")
+        UtilArgs_AddField(s, "op",    "string", 1, "Operation: undo | revert | redo | list | status | clear", "op")
+        UtilArgs_AddField(s, "steps", "int",    0, "Number of matching changes to undo (default 1)", "steps")
+        UtilArgs_AddField(s, "path",  "string", 0, "File or directory. undo, revert, and redo only touch journal entries under this path.", "path")
         UtilArgs_SetDefault(s, "steps", "1")
         ReturnValue(s)
     }
@@ -497,6 +498,122 @@ Function.CCUndo_DoClear {
     }
 }
 
+// 1 when path is root itself or a file inside root.
+Function.CCUndo_UnderPath {
+    Input: path: Address
+    Input: root: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(root, 0) ThenBlock: { ReturnValue(0) }
+        plen = StringLength(path)
+        rlen = StringLength(root)
+        IfCondition LessEqual(rlen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(plen, rlen) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, rlen) {
+            IfCondition NotEqual(GetByte(path, i), GetByte(root, i)) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(plen, rlen) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(GetByte(root, Subtract(rlen, 1)), 47) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(GetByte(path, rlen), 47) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Restore the newest journal entries under root. Entries outside root stay,
+// including ones newer than the match, so a global head cannot rewind another repo.
+Function.CCUndo_DoRevert {
+    Input: root: Address
+    Input: steps: Integer
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(root, 0) ThenBlock: {
+            CCUndo_WriteErr(err_buf, "path required. Undo only restores entries under that file or directory. op=list shows the stack.")
+            ReturnValue(0)
+        }
+        IfCondition LessEqual(StringLength(root), 0) ThenBlock: {
+            CCUndo_WriteErr(err_buf, "path required. Undo only restores entries under that file or directory. op=list shows the stack.")
+            ReturnValue(0)
+        }
+        CCUndo_EnsureDir()
+        head = CCUndo_ReadHead()
+        IfCondition EqualTo(head, 0) ThenBlock: {
+            CCUndo_WriteErr(err_buf, "nothing to undo")
+            ReturnValue(0)
+        }
+        // A path-scoped undo can delete an older entry and leave HEAD
+        // pointing at a journal hole. Skip those before looking for a match.
+        WhileLoop GreaterThan(head, 0) {
+            IfCondition EqualTo(CCUndo_FileExists(CCUndo_EntryPath(head, ".path")), 1) ThenBlock: { BreakLoop }
+            head = Subtract(head, 1)
+        }
+        CCUndo_WriteHead(head)
+        IfCondition EqualTo(head, 0) ThenBlock: {
+            CCUndo_WriteErr(err_buf, "nothing to undo")
+            ReturnValue(0)
+        }
+        IfCondition LessEqual(steps, 0) ThenBlock: { steps = 1 }
+        done = 0
+        seq = head
+        result = StringConcat("Undid entries under ", root)
+        WhileLoop And(GreaterThan(seq, 0), LessThan(done, steps)) {
+            epath = CCUndo_EntryPath(seq, ".path")
+            path_str = CCUndo_ReadFile(epath)
+            IfCondition And(NotEqual(path_str, 0), EqualTo(CCUndo_UnderPath(path_str, root), 1)) ThenBlock: {
+                newmark = CCUndo_EntryPath(seq, ".new")
+                is_new = CCUndo_FileExists(newmark)
+                afterdata = CCUndo_ReadFile(path_str)
+                after_len = CCUndoState.bak_len
+                IfCondition EqualTo(is_new, 1) ThenBlock: {
+                    CCUndo_Unlink(path_str)
+                    result = StringConcat(result, "\n  removed ")
+                    result = StringConcat(result, path_str)
+                } ElseBlock: {
+                    bak = CCUndo_EntryPath(seq, ".bak")
+                    bakdata = CCUndo_ReadFile(bak)
+                    IfCondition EqualTo(bakdata, 0) ThenBlock: {
+                        result = StringConcat(result, "\n  [error] missing backup for ")
+                        result = StringConcat(result, path_str)
+                    } ElseBlock: {
+                        ok = CCUndo_WriteFile(path_str, bakdata, CCUndoState.bak_len)
+                        IfCondition EqualTo(ok, 1) ThenBlock: {
+                            result = StringConcat(result, "\n  restored ")
+                            result = StringConcat(result, path_str)
+                        } ElseBlock: {
+                            result = StringConcat(result, "\n  [error] restore failed: ")
+                            result = StringConcat(result, path_str)
+                        }
+                    }
+                }
+                IfCondition NotEqual(afterdata, 0) ThenBlock: {
+                    CCUndo_RecordRedoEntry(path_str, afterdata, after_len, is_new)
+                }
+                CCUndo_Unlink(epath)
+                CCUndo_Unlink(CCUndo_EntryPath(seq, ".bak"))
+                CCUndo_Unlink(newmark)
+                IfCondition EqualTo(seq, head) ThenBlock: {
+                    head = Subtract(head, 1)
+                    WhileLoop GreaterThan(head, 0) {
+                        IfCondition EqualTo(CCUndo_FileExists(CCUndo_EntryPath(head, ".path")), 1) ThenBlock: { BreakLoop }
+                        head = Subtract(head, 1)
+                    }
+                    CCUndo_WriteHead(head)
+                }
+                done = Add(done, 1)
+            }
+            seq = Subtract(seq, 1)
+        }
+        IfCondition EqualTo(done, 0) ThenBlock: {
+            CCUndo_WriteErr(err_buf, "no undo entry under that path")
+            ReturnValue(0)
+        }
+        ReturnValue(result)
+    }
+}
+
 Function.CCUndo_DoUndo {
     Input: steps: Integer
     Input: err_buf: Address
@@ -741,13 +858,47 @@ Function.CCUndo_HandleRequest {
             IfCondition EqualTo(StringCompare(op, "clear"), 0) ThenBlock: {
                 content = CCUndo_DoClear(err_buf)
             }
-            IfCondition EqualTo(StringCompare(op, "undo"), 0) ThenBlock: {
+            IfCondition Or(EqualTo(StringCompare(op, "undo"), 0), EqualTo(StringCompare(op, "revert"), 0)) ThenBlock: {
                 steps = UtilArgs_GetInt(validated, "steps")
-                content = CCUndo_DoUndo(steps, err_buf)
+                upath = UtilArgs_GetString(validated, "path")
+                content = CCUndo_DoRevert(upath, steps, err_buf)
             }
             IfCondition EqualTo(StringCompare(op, "redo"), 0) ThenBlock: {
                 steps = UtilArgs_GetInt(validated, "steps")
-                content = CCUndo_DoRedo(steps, err_buf)
+                rpath = UtilArgs_GetString(validated, "path")
+                IfCondition EqualTo(rpath, 0) ThenBlock: {
+                    CCUndo_WriteErr(err_buf, "path required. Redo only re-applies entries under that file or directory.")
+                } ElseBlock: {
+                    IfCondition LessEqual(steps, 0) ThenBlock: { steps = 1 }
+                    content = StringConcat("Redo under ", rpath)
+                    rdone = 0
+                    WhileLoop LessThan(rdone, steps) {
+                        rhead = CCUndo_ReadRedoHead()
+                        IfCondition EqualTo(rhead, 0) ThenBlock: { rdone = steps }
+                        IfCondition GreaterThan(rhead, 0) ThenBlock: {
+                            rps = CCUndo_ReadFile(CCUndo_RedoEntryPath(rhead, ".path"))
+                            IfCondition EqualTo(CCUndo_UnderPath(rps, rpath), 1) ThenBlock: {
+                                one = CCUndo_DoRedo(1, err_buf)
+                                IfCondition EqualTo(one, 0) ThenBlock: { rdone = steps }
+                                IfCondition NotEqual(one, 0) ThenBlock: {
+                                    content = StringConcat(content, "\n")
+                                    content = StringConcat(content, one)
+                                    rdone = Add(rdone, 1)
+                                }
+                            } ElseBlock: {
+                                IfCondition EqualTo(rdone, 0) ThenBlock: {
+                                    CCUndo_WriteErr(err_buf, "redo head is outside that path; op=list shows it. Nothing was popped.")
+                                    content = 0
+                                }
+                                rdone = steps
+                            }
+                        }
+                    }
+                    IfCondition And(EqualTo(rdone, 0), EqualTo(GetByte(err_buf, 0), 0)) ThenBlock: {
+                        CCUndo_WriteErr(err_buf, "nothing to redo")
+                        content = 0
+                    }
+                }
             }
             IfCondition EqualTo(content, 0) ThenBlock: {
                 IfCondition EqualTo(GetByte(err_buf, 0), 0) ThenBlock: {

@@ -15,6 +15,7 @@ LibraryImport.UtilArgs
 
 FixedPool.CCSleepSys {
     "SYS_NANOSLEEP": Initialize=35
+    "SYS_POLL":      Initialize=7
 }
 
 FixedPool.CCSleepConst {
@@ -170,13 +171,52 @@ SubRoutine.Main {
     CCSleepState.listen_fd = fd
     PrintMessage("[cc_sleep_ipc] listening on @halcode/Sleep\n")
 
+    // One persistent client (the host). Closing after the schema exchange
+    // left the host holding a dead fd, so the next Sleep call read EOF and
+    // reported "tool crashed or connection lost". Extra accepts are one-shot.
     WhileLoop EqualTo(CCSleepState.running, 1) {
         client_fd = Socket.Accept(CCSleepState.listen_fd)
         IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
-            req = Socket.RecvMsg(client_fd)
-            IfCondition NotEqual(req, 0) ThenBlock: {
-                CCSleep_HandleRequest(client_fd, req)
+            done = 0
+            pfd = Allocate(16)
+            WhileLoop EqualTo(done, 0) {
+                StoreValue(pfd, client_fd, "dword")
+                SetByte(pfd, 4, 1)
+                SetByte(pfd, 5, 0)
+                SetByte(pfd, 6, 0)
+                SetByte(pfd, 7, 0)
+                StoreValue(Add(pfd, 8), CCSleepState.listen_fd, "dword")
+                SetByte(pfd, 12, 1)
+                SetByte(pfd, 13, 0)
+                SetByte(pfd, 14, 0)
+                SetByte(pfd, 15, 0)
+                SystemCall(CCSleepSys.SYS_POLL, pfd, 2, -1, 0, 0)
+                rev_listen = GetByte(pfd, 14)
+                rev_client = GetByte(pfd, 6)
+                IfCondition NotEqual(rev_listen, 0) ThenBlock: {
+                    new_fd = Socket.Accept(CCSleepState.listen_fd)
+                    IfCondition GreaterEqual(new_fd, 0) ThenBlock: {
+                        Socket.SetRecvTimeout(new_fd, 10000)
+                        mcp_req = Socket.RecvMsg(new_fd)
+                        IfCondition NotEqual(mcp_req, 0) ThenBlock: {
+                            IfCondition NotEqual(mcp_req, -1) ThenBlock: {
+                                CCSleep_HandleRequest(new_fd, mcp_req)
+                            }
+                        }
+                        Socket.Close(new_fd)
+                    }
+                }
+                IfCondition NotEqual(rev_client, 0) ThenBlock: {
+                    req = Socket.RecvMsg(client_fd)
+                    IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                    IfCondition NotEqual(req, 0) ThenBlock: {
+                        IfCondition NotEqual(req, -1) ThenBlock: {
+                            CCSleep_HandleRequest(client_fd, req)
+                        }
+                    }
+                }
             }
+            Deallocate(pfd, 16)
             Socket.Close(client_fd)
         }
     }

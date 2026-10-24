@@ -27,6 +27,7 @@ FixedPool.AgentSys {
     "SYS_WAIT4":     Initialize=61
     "SYS_MKDIR":     Initialize=83
     "SYS_UNLINK":    Initialize=87
+    "SYS_SETPGID":   Initialize=109
 }
 
 FixedPool.AgentConst {
@@ -38,6 +39,21 @@ FixedPool.AgentState {
     "schema":        Initialize=0, CanChange=True
     "listen_fd":     Initialize=-1, CanChange=True
     "running":       Initialize=1, CanChange=True
+}
+
+// Leave the tool's process group and drop every inherited socket.
+// The daemon is forked from cc_agent_ipc, so without this it keeps the
+// @halcode/Agent listen fd and the host's client fd. A read on that dup
+// steals bytes from the host, and the host then treats the agent as gone.
+Function.Agent_Detach {
+    Body: {
+        SystemCall(AgentSys.SYS_SETPGID, 0, 0, 0, 0, 0)
+        afd = 3
+        WhileLoop LessThan(afd, 128) {
+            SystemCall(AgentSys.SYS_CLOSE, afd, 0, 0, 0, 0)
+            afd = Add(afd, 1)
+        }
+    }
 }
 
 // Inherit environment variables (API keys, HALCODE_WORKER) for the worker.
@@ -256,8 +272,10 @@ Function.Agent_HandleRequest {
                 IfCondition GreaterThan(pid2, 0) ThenBlock: {
                     SystemCall(AgentSys.SYS_EXIT, 0, 0, 0, 0, 0)
                 }
-                
-                // Background Worker (Daemon)
+
+                // Background Worker (Daemon). Detach before any other call
+                // so this process cannot read the parent's client socket.
+                Agent_Detach()
                 Arena_Init()
                 log_path = StringConcat("/tmp/hal_agent_", t_id)
                 log_path = StringConcat(log_path, ".log")
@@ -317,6 +335,7 @@ Function.Agent_HandleRequest {
                 Agent_LogMsg(log_path, "[daemon] spawning HalCode9000.x worker")
                 cpid = SystemCall(AgentSys.SYS_FORK, 0, 0, 0, 0, 0)
                 IfCondition EqualTo(cpid, 0) ThenBlock: {
+                    Agent_Detach()
                     argv = Allocate(32)
                     StoreValue(Add(argv, 0), "/bin/sh")
                     StoreValue(Add(argv, 8), "-c")

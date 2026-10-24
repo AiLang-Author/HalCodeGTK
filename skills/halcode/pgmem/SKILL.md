@@ -40,8 +40,11 @@ Pgmem op=park  key=<label>  kind=<kind>  content=<text>
 ```
 Pgmem op=search   query=<text>   [kind=...]  [scope=...]  [session_id=...]
 Pgmem op=pickup   key=<label>    [session_id=<id>]
+Pgmem op=poll     key=<label>    [session_id=<id>]
 Pgmem op=tree     [session_id=<id>]  [scope=project]
 ```
+
+`op=poll` is the same read as pickup and returns immediately. A miss is the text `ready: false` (not an error). A hit is the stored text. Use it after `Sleep` when waiting on a known key. Do not call it again until the next Sleep.
 
 **Do not use `pickup` as a general-purpose read** — it requires an exact key match and holds the socket while executing. Use `search` for anything discovery-oriented.
 
@@ -79,6 +82,6 @@ Pgmem op=task_get     task_id=<id>
 
 ## Anti-Patterns
 
-- **Don't poll `op=pickup` in a loop** — while a pickup call is in-flight the socket is held, which blocks sub-agent daemons from calling `task_end`. Use `Sleep seconds=90` once, then check with `op=search` or `op=task_get`.
+- **Don't poll `op=pickup` or `op=poll` in a loop** — a call holds the single-threaded socket, which blocks sub-agent daemons from calling `task_end`. Use `Sleep seconds=90` once, then one `op=poll` on the known key. `ready: false` means Sleep again. `op=search` and `op=task_get` are for discovery, not for waiting.
 - **Don't use Pgmem for symbol queries** — use the Relmem tool directly (`op=symbols`, `op=where`, `op=query`, `op=callers`). Relmem owns `hc_files`/`hc_symbols`/`hc_symbol_edges` in the same postgres DB.
 - **Don't park then immediately pickup** — park writes are async-friendly but the socket is still single-threaded. Do all parks first, then reads.

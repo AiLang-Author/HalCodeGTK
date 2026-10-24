@@ -16,6 +16,7 @@ FixedPool.CCWcSys {
     "SYS_READ":   Initialize=0
     "SYS_OPEN":   Initialize=2
     "SYS_CLOSE":  Initialize=3
+    "SYS_FSTAT":  Initialize=5
     "SYS_MKDIR":  Initialize=83
     "SYS_UNLINK": Initialize=87
 }
@@ -92,6 +93,19 @@ Function.CCWc_DoCount {
     Body: {
         fd = SystemCall(CCWcSys.SYS_OPEN, path, 0, 0)
         IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        st = Allocate(144)
+        fs = SystemCall(CCWcSys.SYS_FSTAT, fd, st, 0, 0)
+        is_dir = 0
+        IfCondition GreaterEqual(fs, 0) ThenBlock: {
+            mode = Add(GetByte(st, 24), Multiply(GetByte(st, 25), 256))
+            IfCondition EqualTo(BitwiseAnd(mode, 61440), 16384) ThenBlock: { is_dir = 1 }
+        }
+        Deallocate(st, 144)
+        IfCondition EqualTo(is_dir, 1) ThenBlock: {
+            SystemCall(CCWcSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
 
         buf = Allocate(CCWcConst.READ_CHUNK)
         lines = 0
@@ -228,6 +242,11 @@ Function.CCWc_HandleRequest {
             ok = CCWc_DoCount(path)
             IfCondition EqualTo(ok, 0) ThenBlock: {
                 err = StringConcat("open failed: ", path)
+                CCWc_SendError(client_fd, id, err)
+                JSON.Free(parsed)  ReturnValue(0)
+            }
+            IfCondition LessThan(ok, 0) ThenBlock: {
+                err = StringConcat("is a directory: ", path)
                 CCWc_SendError(client_fd, id, err)
                 JSON.Free(parsed)  ReturnValue(0)
             }

@@ -7,9 +7,10 @@
 //   output (required for compile): absolute path for output binary
 //
 // Response JSON:
-//   { "ok": bool, "errors": N, "warnings": M,
+//   { "ok": bool,
 //     "output": "<path>",   // compile only, on success
-//     "content": "<full compiler/analyzer stdout+stderr>" }
+//     "content": "<full compiler/analyzer stdout+stderr>",
+//     "error": "<content, or an exit status>" }  // only when ok is false
 //
 // Binaries resolved via /usr/local/bin symlinks — rebuilds are live immediately.
 //
@@ -32,13 +33,14 @@ FixedPool.CCAilangSys {
     "SYS_WAIT4":     Initialize=61
     "SYS_MKDIR":     Initialize=83
     "SYS_NANOSLEEP": Initialize=35
+    "SYS_KILL":      Initialize=62
     "WNOHANG":       Initialize=1
 }
 
 FixedPool.CCAilangConst {
     "SOCK_PATH":  Initialize="@halcode/Ailang", CanChange=True
     "BACKLOG":    Initialize=8
-    "OUT_MAX":    Initialize=65536
+    "OUT_MAX":    Initialize=262144
     "READ_CHUNK": Initialize=4096
     "COMPILER":   Initialize="/usr/local/bin/ailang.x"
     "ANALYZER":   Initialize="/usr/local/bin/analyzer.x"
@@ -162,24 +164,32 @@ Function.CCAlg_Run {
         SetByte(buf, used, 0)
         SystemCall(CCAilangSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
 
-        // Reap child (WNOHANG loop, 10 x 100ms max).
+        // Reap child. 600 x 100ms = 60s, then SIGKILL so a stuck
+        // analyzer cannot be reported as exit 0 and leaked.
         status_buf = Allocate(8)
         StoreValue(status_buf, 0)
         raw_status = 0
+        reaped = 0
         wi = 0
-        WhileLoop LessThan(wi, 10) {
+        WhileLoop LessThan(wi, 600) {
             wr = SystemCall(CCAilangSys.SYS_WAIT4, pid, status_buf, CCAilangSys.WNOHANG, 0, 0)
-            IfCondition NotEqual(wr, 0) ThenBlock: {
+            IfCondition GreaterThan(wr, 0) ThenBlock: {
                 raw_status = Dereference(status_buf, "dword")
-                wi = 10
-            } ElseBlock: {
-                ts = Allocate(16)
-                StoreValue(ts, 0)
-                StoreValue(Add(ts, 8), 100000000)
-                SystemCall(CCAilangSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
-                Deallocate(ts, 16)
-                wi = Add(wi, 1)
+                reaped = 1
+                BreakLoop
             }
+            IfCondition LessThan(wr, 0) ThenBlock: { BreakLoop }
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(CCAilangSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+            Deallocate(ts, 16)
+            wi = Add(wi, 1)
+        }
+        IfCondition EqualTo(reaped, 0) ThenBlock: {
+            SystemCall(CCAilangSys.SYS_KILL, pid, 9, 0, 0, 0)
+            SystemCall(CCAilangSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+            raw_status = Dereference(status_buf, "dword")
         }
         Deallocate(status_buf, 8)
         CCAilangState.last_exit = BitwiseAnd(RightShift(raw_status, 8), 255)
@@ -202,6 +212,17 @@ Function.CCAlg_BuildSchema {
     }
 }
 
+// SerializeObject returns a fresh string. The response object aliases
+// literals and caller buffers, so it must not be JSON.Free'd.
+Function.CCAlg_FreeStr {
+    Input: str: Address
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(str)
+        Deallocate(str, Add(n, 1))
+    }
+}
+
 Function.CCAlg_SendError {
     Input: client_fd: Integer
     Input: id: Address
@@ -212,7 +233,9 @@ Function.CCAlg_SendError {
         IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
         JSON.SetBool(resp, "ok", 0)
         JSON.SetString(resp, "error", msg)
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
     }
 }
 
@@ -231,7 +254,24 @@ Function.CCAlg_SendResult {
             JSON.SetString(resp, "output", output_path)
         }
         JSON.SetString(resp, "content", content)
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        // The host reads "error" for the failure text. A non-zero compiler
+        // exit used to leave that field out, so the chat showed "no detail".
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            detail = content
+            use_fallback = 0
+            IfCondition EqualTo(detail, 0) ThenBlock: { use_fallback = 1 }
+            IfCondition EqualTo(use_fallback, 0) ThenBlock: {
+                dlen = StringLength(detail)
+                IfCondition EqualTo(dlen, 0) ThenBlock: { use_fallback = 1 }
+            }
+            IfCondition EqualTo(use_fallback, 1) ThenBlock: {
+                detail = StringConcat("compiler or analyzer exited ", NumberToString(CCAilangState.last_exit))
+            }
+            JSON.SetString(resp, "error", detail)
+        }
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
     }
 }
 
@@ -244,7 +284,9 @@ Function.CCAlg_SendSchema {
         resp = JSON.NewObject()
         JSON.SetString(resp, "method", "schema_response")
         IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        CCAlg_FreeStr(wire)
     }
 }
 
@@ -331,8 +373,16 @@ Function.CCAlg_HandleRequest {
                     CCAlg_SendError(client_fd, id, "failed to fork analyzer process")
                     JSON.Free(parsed)  ReturnValue(0)
                 }
+                // analyzer.x exits 1 for warnings with zero errors
+                // ("Summary: 0 errors, N warnings") and 2 for real errors.
+                // Parse failures also exit 1, but they never print that summary.
                 ok = 0
                 IfCondition EqualTo(CCAilangState.last_exit, 0) ThenBlock: { ok = 1 }
+                IfCondition EqualTo(CCAilangState.last_exit, 1) ThenBlock: {
+                    IfCondition EqualTo(StringContains(CCAilangState.out_buf, "Summary: 0 errors"), 1) ThenBlock: {
+                        ok = 1
+                    }
+                }
                 CCAlg_SendResult(client_fd, id, ok, 0, CCAilangState.out_buf)
                 JSON.Free(parsed)
                 ReturnValue(0)
@@ -378,6 +428,7 @@ SubRoutine.Main {
                 IfCondition NotEqual(req, 0) ThenBlock: {
                     IfCondition NotEqual(req, -1) ThenBlock: {
                         CCAlg_HandleRequest(client_fd, req)
+                        CCAlg_FreeStr(req)
                     }
                 }
             }

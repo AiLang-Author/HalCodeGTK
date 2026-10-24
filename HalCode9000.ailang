@@ -48,6 +48,11 @@ FixedPool.CCSys {
     "SYS_READLINK":  Initialize=89
     "SYS_WAIT4":     Initialize=61
     "SYS_PRCTL":     Initialize=157
+    "SYS_POLL":      Initialize=7
+    "SYS_RT_SIGPROCMASK": Initialize=14
+    "SYS_SETPGID":   Initialize=109
+    "SYS_SIGNALFD":  Initialize=289
+    "SYS_GETDENTS64": Initialize=217
     "SYS_TIME":      Initialize=201
     "SYS_RENAME":    Initialize=82
     "SYS_UNLINK":    Initialize=87
@@ -63,7 +68,7 @@ FixedPool.CCConst {
     "INPUT_BUF_SZ":   Initialize=1048576      // 1MB
     "LINE_BUF_SZ":    Initialize=1048576      // 1MB - prevents Buffer Bound overflows
     "SSE_STATE_SZ":   Initialize=88
-    "MAX_CHILDREN":   Initialize=32
+    "MAX_CHILDREN":   Initialize=64
     "BIND_WAIT_NS":   Initialize=5000000000   // 5s — allows slower tools like relmem to bind
     "PARK_THRESHOLD": Initialize=32768        // 32KB — fixes PGMEM SPILL PANIC
     "LOG_DIR":        Initialize=0, CanChange=True
@@ -76,7 +81,6 @@ FixedPool.CCRunState {
     "go_home":       Initialize=0, CanChange=True
     "child_pids":    Initialize=0, CanChange=True
     "child_count":   Initialize=0, CanChange=True
-    "auto_approve":  Initialize=0, CanChange=True
     "session_turn":  Initialize=0, CanChange=True
     "auth_mode":     Initialize=0, CanChange=True
     "auth_cred":     Initialize=0, CanChange=True
@@ -88,7 +92,6 @@ FixedPool.CCRunState {
     "ui_thread":     Initialize=0, CanChange=True
     "ui_state":      Initialize=0, CanChange=True
     "fresh":         Initialize=0, CanChange=True
-    "serve_token":   Initialize=0, CanChange=True  // bearer token for --serve mode
 }
 
 // MCP on-demand tool table — stores manifest entries for spawn-per-call dispatch.
@@ -862,8 +865,17 @@ Function.CC_LaunchTool {
             CC_LaunchLog("[launch] CHILD pre_exec ")
             CC_LaunchLog(binary_path)
             CC_LaunchLog("\n")
+            // Own process group so shutdown reaches shells this tool forks.
+            SystemCall(CCSys.SYS_SETPGID, 0, 0, 0, 0, 0)
             // Die automatically when parent exits for any reason (crash, kill, etc.)
             SystemCall(CCSys.SYS_PRCTL, CCSys.PR_SET_PDEATHSIG, CCSys.SIGTERM, 0, 0, 0)
+            // The host blocks SIGINT|SIGTERM for its signalfd. A child that
+            // keeps that mask never runs the parent's death signal, holds
+            // @halcode/<Tool>, and spins in Accept. Unblock both.
+            sigmask = Allocate(8)
+            StoreValue(sigmask, 16386)
+            SystemCall(CCSys.SYS_RT_SIGPROCMASK, 1, sigmask, 0, 8, 0)
+            Deallocate(sigmask, 8)
             // Silence stdout/stderr, exec
             devnull = SystemCall(CCSys.SYS_OPEN, "/dev/null", 1, 0, 0, 0)
             IfCondition GreaterEqual(devnull, 0) ThenBlock: {
@@ -893,11 +905,15 @@ Function.CC_LaunchTool {
             CC_LaunchLog("\n")
             SystemCall(CCSys.SYS_EXIT, 127, 0, 0, 0, 0)
         }
-        // Parent — record PID
+        // Parent — record PID. setpgid from both sides covers the race
+        // where the child has not run yet.
+        SystemCall(CCSys.SYS_SETPGID, pid, pid, 0, 0, 0)
         IfCondition LessThan(CCRunState.child_count, CCConst.MAX_CHILDREN) ThenBlock: {
             slot = Multiply(CCRunState.child_count, 8)
             StoreValue(Add(CCRunState.child_pids, slot), pid)
             CCRunState.child_count = Add(CCRunState.child_count, 1)
+        } ElseBlock: {
+            CC_LaunchLog("[launch] PID TABLE FULL\n")
         }
         ReturnValue(pid)
     }
@@ -916,6 +932,7 @@ Function.CC_KillAllChildren {
             pid = Dereference(Add(CCRunState.child_pids, slot))
             IfCondition GreaterThan(pid, 0) ThenBlock: {
                 SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGTERM, 0, 0, 0)
+                SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGTERM, 0, 0, 0)
             }
             i = Add(i, 1)
         }
@@ -939,8 +956,12 @@ Function.CC_KillAllChildren {
                 wr = SystemCall(CCSys.SYS_WAIT4, pid, status_buf, 1, 0, 0)
                 // 1 = WNOHANG
                 IfCondition EqualTo(wr, 0) ThenBlock: {
-                    // Child still alive — escalate to SIGKILL
+                    // Child still alive — escalate to SIGKILL (the whole group).
                     SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
+                    SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGKILL, 0, 0, 0)
+                }
+                IfCondition EqualTo(wr, -10) ThenBlock: {
+                    StoreValue(Add(CCRunState.child_pids, slot), 0)
                 }
                 IfCondition GreaterThan(wr, 0) ThenBlock: {
                     // Already reaped — mark slot empty
@@ -967,40 +988,169 @@ Function.CC_KillAllChildren {
     }
 }
 
-// Kill any cc_*_ipc.x workers left over from a previous session.
-// PR_SET_PDEATHSIG is unreliable on WSL2 — sockets stay held and the new
-// launch hangs. fork+exec pkill cleans everything up in one shot.
+// 1 if the /proc comm (no parentheses, length n) is one of our tools.
+// comm is truncated to 15 bytes, so cc_ailang_lsp_ipc shows up as cc_ailang_lsp_i.
+Function.CC_CommIsTool {
+    Input: s: Address
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(n, 4) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(s, 0), 99) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(s, 1), 99) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(s, 2), 95) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessEqual(i, Subtract(n, 4)) {
+            IfCondition EqualTo(GetByte(s, i), 95) ThenBlock: {
+                IfCondition EqualTo(GetByte(s, Add(i, 1)), 105) ThenBlock: {
+                    IfCondition EqualTo(GetByte(s, Add(i, 2)), 112) ThenBlock: {
+                        IfCondition EqualTo(GetByte(s, Add(i, 3)), 99) ThenBlock: {
+                            ReturnValue(1)
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(n, 15) ThenBlock: {
+            IfCondition EqualTo(StringCompare(s, "cc_ailang_lsp_i"), 0) ThenBlock: { ReturnValue(1) }
+        }
+        ReturnValue(0)
+    }
+}
+
+// SIGKILL an orphaned cc_*_ipc (ppid 1). A live host's tools have that host
+// as parent, so this does not touch them or HalCode9000.x --mcp.
+Function.CC_KillIfOrphanTool {
+    Input: pid: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(pid, 1) ThenBlock: { ReturnValue(0) }
+        stpath = Allocate(64)
+        SetByte(stpath, 0, 47) SetByte(stpath, 1, 112) SetByte(stpath, 2, 114)
+        SetByte(stpath, 3, 111) SetByte(stpath, 4, 99) SetByte(stpath, 5, 47)
+        digits = Allocate(16)
+        nd = 0
+        v = pid
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(digits, nd, Add(48, Modulo(v, 10)))
+            nd = Add(nd, 1)
+            v = Divide(v, 10)
+        }
+        di = 0
+        WhileLoop LessThan(di, nd) {
+            SetByte(stpath, Add(6, di), GetByte(digits, Subtract(Subtract(nd, 1), di)))
+            di = Add(di, 1)
+        }
+        Deallocate(digits, 16)
+        base = Add(6, nd)
+        SetByte(stpath, base, 47)
+        SetByte(stpath, Add(base, 1), 115)
+        SetByte(stpath, Add(base, 2), 116)
+        SetByte(stpath, Add(base, 3), 97)
+        SetByte(stpath, Add(base, 4), 116)
+        SetByte(stpath, Add(base, 5), 0)
+        fd = SystemCall(CCSys.SYS_OPEN, stpath, 0, 0, 0, 0)
+        Deallocate(stpath, 64)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(512)
+        n = SystemCall(CCSys.SYS_READ, fd, buf, 511, 0, 0)
+        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 512)
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+        lp = -1
+        rp = -1
+        i = 0
+        WhileLoop LessThan(i, n) {
+            ch = GetByte(buf, i)
+            IfCondition EqualTo(ch, 40) ThenBlock: {
+                IfCondition EqualTo(lp, -1) ThenBlock: { lp = i }
+            }
+            IfCondition EqualTo(ch, 41) ThenBlock: { rp = i }
+            i = Add(i, 1)
+        }
+        killed = 0
+        IfCondition And(GreaterEqual(lp, 0), GreaterThan(rp, Add(lp, 1))) ThenBlock: {
+            comm = Add(buf, Add(lp, 1))
+            clen = Subtract(rp, Add(lp, 1))
+            SetByte(buf, rp, 0)
+            IfCondition EqualTo(CC_CommIsTool(comm, clen), 1) ThenBlock: {
+                // ") S ppid" — state is one byte, then a space, then ppid.
+                pp = 0
+                saw = 0
+                j = Add(rp, 4)
+                WhileLoop LessThan(j, n) {
+                    d = GetByte(buf, j)
+                    IfCondition Or(LessThan(d, 48), GreaterThan(d, 57)) ThenBlock: { BreakLoop }
+                    pp = Add(Multiply(pp, 10), Subtract(d, 48))
+                    saw = 1
+                    j = Add(j, 1)
+                }
+                IfCondition And(EqualTo(saw, 1), EqualTo(pp, 1)) ThenBlock: {
+                    SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGKILL, 0, 0, 0)
+                    SystemCall(CCSys.SYS_KILL, Subtract(0, pid), CCSys.SIGKILL, 0, 0, 0)
+                    killed = 1
+                }
+            }
+        }
+        Deallocate(buf, 512)
+        ReturnValue(killed)
+    }
+}
+
+// Drop orphaned cc_*_ipc workers from a previous host. They inherit a blocked
+// SIGTERM, so the parent's death signal never lands and they keep the
+// abstract socket. Only ppid 1. No pkill -f (that regex also matches --mcp
+// command lines and unrelated processes).
 Function.CC_KillStaleTools {
     Body: {
-        pkill_path = "/usr/bin/pkill"
-        arg1 = "-9"
-        arg2 = "-f"
-        arg3 = "cc_.*_ipc"
-        argv = Allocate(40)
-        StoreValue(Add(argv, 0),  pkill_path)
-        StoreValue(Add(argv, 8),  arg1)
-        StoreValue(Add(argv, 16), arg2)
-        StoreValue(Add(argv, 24), arg3)
-        StoreValue(Add(argv, 32), 0)
-        pid = SystemCall(CCSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            envp = Allocate(8)
-            StoreValue(envp, 0)
-            SystemCall(CCSys.SYS_EXECVE, pkill_path, argv, envp)
-            SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+        dirfd = SystemCall(CCSys.SYS_OPEN, "/proc", 65536, 0, 0, 0)
+        IfCondition LessThan(dirfd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(8192)
+        killed = 0
+        WhileLoop 1 {
+            n = SystemCall(CCSys.SYS_GETDENTS64, dirfd, buf, 8192, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            pos = 0
+            WhileLoop LessThan(pos, n) {
+                IfCondition GreaterThan(Add(pos, 20), n) ThenBlock: { BreakLoop }
+                reclen = Add(GetByte(buf, Add(pos, 16)), Multiply(GetByte(buf, Add(pos, 17)), 256))
+                IfCondition Or(LessThan(reclen, 20), GreaterThan(Add(pos, reclen), n)) ThenBlock: { BreakLoop }
+                name = Add(buf, Add(pos, 19))
+                pid = 0
+                okdig = 1
+                k = 0
+                WhileLoop LessThan(k, 10) {
+                    d = GetByte(name, k)
+                    IfCondition EqualTo(d, 0) ThenBlock: { BreakLoop }
+                    IfCondition Or(LessThan(d, 48), GreaterThan(d, 57)) ThenBlock: {
+                        okdig = 0
+                        BreakLoop
+                    }
+                    pid = Add(Multiply(pid, 10), Subtract(d, 48))
+                    k = Add(k, 1)
+                }
+                IfCondition And(EqualTo(okdig, 1), GreaterThan(pid, 1)) ThenBlock: {
+                    IfCondition EqualTo(CC_KillIfOrphanTool(pid), 1) ThenBlock: {
+                        killed = Add(killed, 1)
+                    }
+                }
+                pos = Add(pos, reclen)
+            }
         }
-        IfCondition GreaterThan(pid, 0) ThenBlock: {
-            status = Allocate(8)
-            StoreValue(status, 0)
-            SystemCall(CCSys.SYS_WAIT4, pid, status, 0, 0, 0)
-            Deallocate(status, 8)
+        SystemCall(CCSys.SYS_CLOSE, dirfd, 0, 0, 0, 0)
+        Deallocate(buf, 8192)
+        IfCondition GreaterThan(killed, 0) ThenBlock: {
             ts = Allocate(16)
             StoreValue(Add(ts, 0), 0)
             StoreValue(Add(ts, 8), 200000000)
             SystemCall(CCSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
             Deallocate(ts, 16)
         }
-        Deallocate(argv, 40)
+        ReturnValue(killed)
     }
 }
 
@@ -1214,6 +1364,152 @@ Function.CC_PrintMemoryReport {
     }
 }
 
+// Diagnostics copied out of the HTTP stream handle before it is closed.
+// Layout: [0..127] request-id, [128..511] curl error message. Allocated
+// lazily BEFORE Arena_ScratchBegin() in CC_RunTurn so it survives
+// Arena_ScratchEnd() (same rule as CCRunState.line_buf).
+FixedPool.CCHttpDiag {
+    "buf": Initialize=0, CanChange=True
+}
+
+// Copy at most max-1 bytes of src into dst and NUL-terminate. src may be 0.
+Function.CC_CopyStrBounded {
+    Input: dst: Address
+    Input: src: Address
+    Input: max: Integer
+    Body: {
+        SetByte(dst, 0, 0)
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(src)
+        IfCondition GreaterThan(n, Subtract(max, 1)) ThenBlock: { n = Subtract(max, 1) }
+        MemoryCopy(dst, src, n)
+        SetByte(dst, n, 0)
+    }
+}
+
+// Short human hint for an HTTP error status. Returns "" when there is none.
+Function.CC_HttpStatusHint {
+    Input: status: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(status, 400) ThenBlock: { ReturnValue("request rejected (malformed or unsupported parameters)") }
+        IfCondition EqualTo(status, 401) ThenBlock: { ReturnValue("authentication failed, check the provider API key") }
+        IfCondition EqualTo(status, 403) ThenBlock: { ReturnValue("forbidden, the key lacks access to this model or endpoint") }
+        IfCondition EqualTo(status, 404) ThenBlock: { ReturnValue("not found, check the model name and provider URL") }
+        IfCondition EqualTo(status, 408) ThenBlock: { ReturnValue("request timed out") }
+        IfCondition EqualTo(status, 413) ThenBlock: { ReturnValue("request too large, the conversation exceeds the provider limit") }
+        IfCondition EqualTo(status, 422) ThenBlock: { ReturnValue("request rejected (invalid parameters)") }
+        IfCondition EqualTo(status, 429) ThenBlock: { ReturnValue("rate limited") }
+        IfCondition EqualTo(status, 529) ThenBlock: { ReturnValue("provider overloaded") }
+        IfCondition GreaterEqual(status, 500) ThenBlock: { ReturnValue("provider server error") }
+        ReturnValue("")
+    }
+}
+
+// Gauges the model was told to manage and could not read.
+Function.CC_StatusReport {
+    Input: chains: Integer
+    Output: Address
+    Body: {
+        s = StringConcat("tokens_in: ", NumberToString(UILayout.tok_in))
+        s = StringConcat(s, "\ntokens_out: ")
+        s = StringConcat(s, NumberToString(UILayout.tok_out))
+        s = StringConcat(s, "\nwindow: 180000")
+        s = StringConcat(s, "\npct: ")
+        s = StringConcat(s, NumberToString(UILayout.ctx_pct))
+        s = StringConcat(s, "\ntool_chains: ")
+        s = StringConcat(s, NumberToString(chains))
+        proj = "(none)"
+        IfCondition NotEqual(UILayout.proj_slug, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(UILayout.proj_slug), 0) ThenBlock: {
+                proj = UILayout.proj_slug
+            }
+        }
+        th = "(none)"
+        IfCondition NotEqual(UILayout.thread_slug, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(UILayout.thread_slug), 0) ThenBlock: {
+                th = UILayout.thread_slug
+            }
+        }
+        s = StringConcat(s, "\nproject: ")
+        s = StringConcat(s, proj)
+        s = StringConcat(s, "\nthread: ")
+        s = StringConcat(s, th)
+        sbuf = Allocate(80)
+        SetByte(sbuf, 0, 0)
+        sn = CC_ReadAppFile("/tmp/halcode_app/session.txt", sbuf, 80)
+        IfCondition LessEqual(sn, 0) ThenBlock: { sbuf = "(none)" }
+        s = StringConcat(s, "\nsession: ")
+        s = StringConcat(s, sbuf)
+        s = StringConcat(s, "\nsession_log_bytes: ")
+        s = StringConcat(s, NumberToString(CCRunState.log_bytes))
+        ReturnValue(s)
+    }
+}
+
+// One line the daemon can see. The model should not re-park this after every tool.
+Function.CC_ParkDigest {
+    Input: name: Address
+    Input: arg: Address
+    Input: is_err: Integer
+    Body: {
+        dig = name
+        IfCondition EqualTo(dig, 0) ThenBlock: { dig = "?" }
+        dig = StringConcat(dig, " ")
+        IfCondition NotEqual(arg, 0) ThenBlock: { dig = StringConcat(dig, arg) }
+        IfCondition EqualTo(is_err, 1) ThenBlock: {
+            dig = StringConcat(dig, " -> error")
+        } ElseBlock: {
+            dig = StringConcat(dig, " -> ok")
+        }
+        park_args = JSON.NewObject()
+        JSON.SetString(park_args, "op", "park")
+        JSON.SetString(park_args, "key", "tool_digest")
+        JSON.SetString(park_args, "kind", "note")
+        JSON.SetString(park_args, "scope", "persistent")
+        JSON.SetString(park_args, "content", dig)
+        perr = Allocate(8)
+        StoreValue(perr, 0, "dword")
+        pgmem_ret = IPCDispatch.Dispatch("Pgmem", park_args, "", perr)
+        Deallocate(perr, 8)
+        IfCondition NotEqual(pgmem_ret, 0) ThenBlock: {
+            Deallocate(pgmem_ret, Add(StringLength(pgmem_ret), 1))
+        }
+    }
+}
+
+// Last line of a tool result when it is a truncation trailer.
+// Read and LS append "[truncated ...]". Parking replaces the body
+// with a short stub, and that trailer has to stay visible.
+Function.CC_ParkTruncLine {
+    Input: content: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(content, 0) ThenBlock: { ReturnValue(0) }
+        clen = StringLength(content)
+        IfCondition LessEqual(clen, 12) ThenBlock: { ReturnValue(0) }
+        i = Subtract(clen, 1)
+        WhileLoop And(GreaterThan(i, 0), NotEqual(GetByte(content, i), 10)) {
+            i = Subtract(i, 1)
+        }
+        start = 0
+        IfCondition EqualTo(GetByte(content, i), 10) ThenBlock: {
+            start = Add(i, 1)
+        }
+        mark = "[truncated"
+        mlen = StringLength(mark)
+        IfCondition LessThan(Subtract(clen, start), mlen) ThenBlock: { ReturnValue(0) }
+        j = 0
+        WhileLoop LessThan(j, mlen) {
+            IfCondition NotEqual(GetByte(content, Add(start, j)), GetByte(mark, j)) ThenBlock: {
+                ReturnValue(0)
+            }
+            j = Add(j, 1)
+        }
+        ReturnValue(Add(content, start))
+    }
+}
+
 Function.CC_RunTurn {
     Output: Integer
     Body: {
@@ -1229,50 +1525,9 @@ Function.CC_RunTurn {
         WhileLoop EqualTo(keep_going, 1) {
             keep_going = 0
 
-            IfCondition And(GreaterEqual(chain_count, 25), EqualTo(CCRunState.auto_approve, 0)) ThenBlock: {
-                UI.ChatTag("?", "Agent has chained 25 tools. Continue? [Y/n/a (always) or type to steer]", 3) // 3 = ORANGE
-                ans = UI.ReadLine()
-                ans_len = StringLength(ans)
-                steering = 0
-                
-                IfCondition EqualTo(ans_len, 0) ThenBlock: {
-                    chain_count = 0
-                } ElseBlock: {
-                    first = GetByte(ans, 0)
-                    IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 110), EqualTo(first, 78))) ThenBlock: {
-                        UI.ChatTag("✗", "Execution paused.", 1) // 1 = RED
-                        BreakLoop
-                    } ElseBlock: {
-                        IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 97), EqualTo(first, 65))) ThenBlock: {
-                            CCRunState.auto_approve = 1
-                            chain_count = 0
-                        } ElseBlock: {
-                            IfCondition And(EqualTo(ans_len, 1), Or(EqualTo(first, 121), EqualTo(first, 89))) ThenBlock: {
-                                chain_count = 0
-                            } ElseBlock: {
-                                steering = 1
-                            }
-                        }
-                    }
-                }
-                IfCondition EqualTo(steering, 1) ThenBlock: {
-                    dummy = JSON.NewObject()
-                    dummy_role = CC_StrDup("assistant")
-                    dummy_text = CC_StrDup("[System: Awaiting user steering]")
-                    JSON.SetString(dummy, "role", dummy_role)
-                    JSON.SetString(dummy, "content", dummy_text)
-                    IfCondition NotEqual(SelectedProvider.reasoning_effort, 0) ThenBlock: {
-                        dummy_rc = CC_StrDup("")
-                        JSON.SetString(dummy, "reasoning_content", dummy_rc)
-                    }
-                    History.AppendRaw(dummy)
-                    
-                    History.AppendUser(ans)
-                    keep_going = 1
-                    chain_count = 0
-                    ContinueLoop
-                }
-            }
+            // No round cap. The old pause existed for an echo-back loop
+            // in a previous harness. Agent stdin is the prompt file, so a
+            // ReadLine here would spin until the desk's wall timer.
             chain_count = Add(chain_count, 1)
 
             // --- Retry Loop for API calls ---
@@ -1292,6 +1547,9 @@ Function.CC_RunTurn {
             tools = IPCDispatch.GetToolSchemasArray()
             IfCondition EqualTo(CCRunState.line_buf, 0) ThenBlock: {
                 CCRunState.line_buf = Allocate(CCConst.LINE_BUF_SZ)
+            }
+            IfCondition EqualTo(CCHttpDiag.buf, 0) ThenBlock: {
+                CCHttpDiag.buf = Allocate(512)
             }
             Arena_ScratchBegin()
             body = Backend.BuildRequest(messages, tools)
@@ -1466,6 +1724,15 @@ Function.CC_RunTurn {
                 }
             }
 
+            // Capture response status/diagnostics BEFORE CloseStream: the strings
+            // point into the stream handle. -1 = unknown (e.g. interrupted).
+            http_status = HTTP.GetStatus(handle)
+            http_retry_after = HTTP.GetRetryAfter(handle)
+            CC_CopyStrBounded(CCHttpDiag.buf, HTTP.GetRequestId(handle), 128)
+            CC_CopyStrBounded(Add(CCHttpDiag.buf, 128), HTTP.GetErrorMsg(handle), 384)
+            CC_DebugLog(StringConcat("HTTP status=", NumberToString(http_status)))
+            CC_DebugLog(StringConcat(" request-id=", CCHttpDiag.buf))
+            CC_DebugLog("\n")
             HTTP.CloseStream(handle)
             Deallocate(sse_state, CCConst.SSE_STATE_SZ)
             Deallocate(body, Add(StringLength(body), 1))
@@ -1499,7 +1766,12 @@ Function.CC_RunTurn {
             IfCondition And(EqualTo(clean_stop, 0), EqualTo(is_api_error, 0)) ThenBlock: {
                 CC_DebugLog("API stream DROPPED without clean stop.\n")
                 CC_AgentLog("[worker] API stream DROPPED without clean stop")
-                UI.ChatTag("✗", "API connection dropped mid-stream (Overload / Timeout)", 1)
+                // Prefer curl's real reason (DNS, connect, TLS, timeout) over a guess.
+                IfCondition GreaterThan(StringLength(Add(CCHttpDiag.buf, 128)), 0) ThenBlock: {
+                    UI.ChatTag("✗", StringConcat("Connection error: ", Add(CCHttpDiag.buf, 128)), 1)
+                } ElseBlock: {
+                    UI.ChatTag("✗", "API connection dropped mid-stream (Overload / Timeout)", 1)
+                }
                 UI.SetState(0)
                 is_api_error = 1
             } ElseBlock: {
@@ -1508,17 +1780,63 @@ Function.CC_RunTurn {
                 }
             }
 
+            // ---- Classify by HTTP status ----
+            // 4xx other than 408/429 can never succeed on retry: fail fast.
+            // 408/429/5xx (incl. 529 overloaded) retry with backoff, raised to the
+            // server's Retry-After. A Retry-After over 60s (e.g. a daily quota) stops
+            // instead of waiting silently. Status 0/-1 (no response / unknown) keeps
+            // the drop handling above.
+            wait_floor_ms = 0
+            IfCondition GreaterEqual(http_status, 400) ThenBlock: {
+                IfCondition EqualTo(is_api_error, 0) ThenBlock: {
+                    is_api_error = 1
+                    UI.SetState(0)
+                }
+                IfCondition And(LessThan(http_status, 500), And(NotEqual(http_status, 408), NotEqual(http_status, 429))) ThenBlock: {
+                    permanent_fail = 1
+                }
+                IfCondition GreaterThan(http_retry_after, 60) ThenBlock: { permanent_fail = 1 }
+                IfCondition GreaterThan(http_retry_after, 0) ThenBlock: {
+                    wait_floor_ms = Multiply(http_retry_after, 1000)
+                }
+                status_msg = StringConcat("HTTP ", NumberToString(http_status))
+                status_hint = CC_HttpStatusHint(http_status)
+                IfCondition GreaterThan(StringLength(status_hint), 0) ThenBlock: {
+                    status_msg = StringConcat(status_msg, " — ")
+                    status_msg = StringConcat(status_msg, status_hint)
+                }
+                IfCondition GreaterThan(http_retry_after, 0) ThenBlock: {
+                    status_msg = StringConcat(status_msg, " (server asks to wait ")
+                    status_msg = StringConcat(status_msg, NumberToString(http_retry_after))
+                    status_msg = StringConcat(status_msg, "s)")
+                }
+                IfCondition GreaterThan(StringLength(CCHttpDiag.buf), 0) ThenBlock: {
+                    status_msg = StringConcat(status_msg, " [request-id ")
+                    status_msg = StringConcat(status_msg, CCHttpDiag.buf)
+                    status_msg = StringConcat(status_msg, "]")
+                }
+                UI.ChatTag("✗", status_msg, 1)
+            }
+
             // If there was any API error, retry with backoff. Otherwise, mark as success.
             IfCondition EqualTo(is_api_error, 1) ThenBlock: {
                 CC_DebugLog(StringConcat("API error detected. Retry ", NumberToString(Add(retry_count, 1))))
                 CC_DebugLog("\n")
                 retry_count = Add(retry_count, 1)
+                IfCondition EqualTo(permanent_fail, 1) ThenBlock: {
+                    // Not retryable: no backoff sleep, just clear in-flight state.
+                    Backend.Reset()
+                    UI.SetReasoning("")
+                } ElseBlock: {
                 IfCondition LessThan(retry_count, max_retries) ThenBlock: {
-                    CC_SleepAnimated(CC_RandomMs(retry_delay_ms))
+                    wait_ms = CC_RandomMs(retry_delay_ms)
+                    IfCondition GreaterThan(wait_floor_ms, wait_ms) ThenBlock: { wait_ms = wait_floor_ms }
+                    CC_SleepAnimated(wait_ms)
                     retry_delay_ms = Multiply(retry_delay_ms, 2)
                     IfCondition GreaterThan(retry_delay_ms, 30000) ThenBlock: { retry_delay_ms = 30000 }
                     Backend.Reset()
                     UI.SetReasoning("")
+                }
                 }
             } ElseBlock: {
                 request_ok = 1
@@ -1533,7 +1851,11 @@ Function.CC_RunTurn {
             UI.ChatPrintln("")
             IfCondition EqualTo(request_ok, 0) ThenBlock: {
                 IfCondition EqualTo(is_interrupted_turn, 0) ThenBlock: {
-                    UI.ChatTag("✗", "All retries exhausted. Any completed tool work is in /tmp/hal_turn_log.txt", 1)
+                    IfCondition EqualTo(permanent_fail, 1) ThenBlock: {
+                        UI.ChatTag("✗", "Request rejected, not retrying. Fix the cause above and resend. Any completed tool work is in /tmp/hal_turn_log.txt", 1)
+                    } ElseBlock: {
+                        UI.ChatTag("✗", "All retries exhausted. Any completed tool work is in /tmp/hal_turn_log.txt", 1)
+                    }
                 }
             }
 
@@ -1615,6 +1937,11 @@ Function.CC_RunTurn {
                                 is_err = 1
                                 ok_flag = 0
                             } ElseBlock: {
+                            IfCondition EqualTo(StringCompare(tname, "Status"), 0) ThenBlock: {
+                                content = CC_StatusReport(chain_count)
+                                is_err = 0
+                                ok_flag = 1
+                            } ElseBlock: {
                             CC_DebugLog("[STEP H7] Allocating err_holder and calling IPCDispatch.Dispatch\n")
                             err_holder = Allocate(8)
                             StoreValue(err_holder, 0, "dword")
@@ -1623,6 +1950,7 @@ Function.CC_RunTurn {
                             is_err = Dereference(err_holder, "dword")
                             Deallocate(err_holder, 8)
                             ok_flag = 1
+                            }
                             }
 
                             log_msg = StringConcat("Tool [", tname)
@@ -1641,6 +1969,9 @@ Function.CC_RunTurn {
                             UI.ToolCallEnd(ok_flag, i, n_tools)
                             CC_TurnLog(tname, arg_sum, content)
                             CC_SessionLogToolResult(tname, content, is_err)
+                            IfCondition And(NotEqual(StringCompare(tname, "Pgmem"), 0), NotEqual(StringCompare(tname, "Status"), 0)) ThenBlock: {
+                                CC_ParkDigest(tname, arg_sum, is_err)
+                            }
 
                             // Park large results in pgmem — avoids stuffing 50KB bash
                             // output into context on every subsequent turn.
@@ -1664,6 +1995,7 @@ Function.CC_RunTurn {
                                 IfCondition NotEqual(pgmem_ret, 0) ThenBlock: {
                                     Deallocate(pgmem_ret, Add(StringLength(pgmem_ret), 1))
                                 }
+                                trunc_line = CC_ParkTruncLine(content)
                                 IfCondition EqualTo(park_failed, 0) ThenBlock: {
                                     CC_DebugLog("Parked large tool output to Pgmem.\n")
                                     nbytes = NumberToString(StringLength(content))
@@ -1671,6 +2003,10 @@ Function.CC_RunTurn {
                                     stub = StringConcat(stub, " bytes key=")
                                     stub = StringConcat(stub, park_key)
                                     stub = StringConcat(stub, "]")
+                                    IfCondition NotEqual(trunc_line, 0) ThenBlock: {
+                                        stub = StringConcat(stub, "\n")
+                                        stub = StringConcat(stub, trunc_line)
+                                    }
                                     content = stub
                                 } ElseBlock: {
                                     CC_DebugLog("Pgmem parking FAILED. Truncating output.\n")
@@ -1691,6 +2027,10 @@ Function.CC_RunTurn {
                                     
                                     content = StringConcat(t_buf, warn_msg)
                                     Deallocate(t_buf, Add(CCConst.PARK_THRESHOLD, 1))
+                                    IfCondition NotEqual(trunc_line, 0) ThenBlock: {
+                                        content = StringConcat(content, "\n")
+                                        content = StringConcat(content, trunc_line)
+                                    }
                                 }
                             }
 
@@ -2989,6 +3329,7 @@ Function.CC_LoadManifest {
 Function.CC_BootTools {
     Body: {
         CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
+        MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
         CCRunState.child_count = 0
 
         CC_WriteStdout(" Loading tools from cc_tools.json...\n")
@@ -3359,15 +3700,10 @@ Function.CC_ChatLoop {
                     UI.ChatPrintln("Logged out and configs cleared. Please restart HalCode9000.")
                     CCRunState.running = 0
                 }
-                // /auto — toggle autonomous mode (no 25-tool confirmation pause)
+                // /auto — the 25-round pause is gone. Keep the command so the
+                // old keystroke does not fall through as a chat message.
                 IfCondition EqualTo(StringCompare(line, "/auto"), 0) ThenBlock: {
-                    IfCondition EqualTo(CCRunState.auto_approve, 0) ThenBlock: {
-                        CCRunState.auto_approve = 1
-                        UI.ChatTag("✓", "Autonomous mode ON — tool chains run without pause.", 2)
-                    } ElseBlock: {
-                        CCRunState.auto_approve = 0
-                        UI.ChatTag("✓", "Autonomous mode OFF — will pause after 25 tool calls.", 3)
-                    }
+                    UI.ChatTag("✓", "Tool chains are not paused. There is no round cap.", 2)
                 }
                 // /tools — toggle tool call display (compact summary vs expanded per-call)
                 IfCondition EqualTo(StringCompare(line, "/tools"), 0) ThenBlock: {
@@ -3976,6 +4312,7 @@ Function.CC_ResolveWorkerSpec {
 Function.CC_RegisterToolsOnly {
     Body: {
         CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
+        MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
         CCRunState.child_count = 0
         proxy_ok = IPCDispatch.ConnectProxy()
         CC_AgentLog(StringConcat("[init] ConnectProxy=", NumberToString(proxy_ok)))
@@ -4326,8 +4663,92 @@ Function.CC_GuiApplySession {
     }
 }
 
+// Non-blocking reap of launch pids. wr==-10 is ECHILD (already collected).
+Function.CC_ReapChildren {
+    Body: {
+        IfCondition EqualTo(CCRunState.child_pids, 0) ThenBlock: { ReturnValue(0) }
+        st = Allocate(8)
+        i = 0
+        WhileLoop LessThan(i, CCRunState.child_count) {
+            slot = Multiply(i, 8)
+            pid = Dereference(Add(CCRunState.child_pids, slot))
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                StoreValue(st, 0)
+                wr = SystemCall(CCSys.SYS_WAIT4, pid, st, 1, 0, 0)
+                IfCondition GreaterThan(wr, 0) ThenBlock: {
+                    StoreValue(Add(CCRunState.child_pids, slot), 0)
+                }
+                IfCondition EqualTo(wr, -10) ThenBlock: {
+                    StoreValue(Add(CCRunState.child_pids, slot), 0)
+                }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(st, 8)
+    }
+}
+
+// Block SIGTERM and SIGINT and return a signalfd. -1 if signalfd is unavailable
+// (signals stay at their current disposition).
+Function.CC_HostArmSig {
+    Output: Integer
+    Body: {
+        mask = Allocate(8)
+        StoreValue(mask, 16386)
+        SystemCall(CCSys.SYS_RT_SIGPROCMASK, 0, mask, 0, 8, 0)
+        sfd = SystemCall(CCSys.SYS_SIGNALFD, -1, mask, 8, 526336, 0)
+        IfCondition LessThan(sfd, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_RT_SIGPROCMASK, 1, mask, 0, 8, 0)
+        }
+        Deallocate(mask, 8)
+        ReturnValue(sfd)
+    }
+}
+
+// Localhost listener. One line, "shutdown", asks the host to exit.
+// Port is written to /tmp/halcode_app/host.port for the shell and the launcher.
+Function.CC_HostCtlOpen {
+    Output: Integer
+    Body: {
+        fd = Socket.Create(2, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+        Socket.SetReuseAddr(fd)
+        br = Socket.BindInet(fd, "127.0.0.1", 47631)
+        IfCondition LessThan(br, 0) ThenBlock: {
+            CC_WriteStdout("[host] ctl bind 127.0.0.1:47631 failed\n")
+            Socket.Close(fd)
+            ReturnValue(-1)
+        }
+        Socket.Listen(fd, 2)
+        Socket.SetNonBlock(fd)
+        CC_WriteAppFile("/tmp/halcode_app/host.port", "47631\n")
+        CC_WriteStdout("[host] ctl 127.0.0.1:47631\n")
+        ReturnValue(fd)
+    }
+}
+
+// Kill every tool we launched and every tool we respawned, plus the shells
+// in those process groups. Then collect any zombie we missed.
+Function.CC_HostShutdown {
+    Body: {
+        CC_WriteStdout("[host] shutdown tools\n")
+        IPCDispatch.Shutdown()
+        CC_KillAllChildren()
+        st = Allocate(8)
+        WhileLoop 1 {
+            StoreValue(st, 0)
+            wr = SystemCall(CCSys.SYS_WAIT4, -1, st, 1, 0, 0)
+            IfCondition LessEqual(wr, 0) ThenBlock: { BreakLoop }
+        }
+        Deallocate(st, 8)
+        SystemCall(CCSys.SYS_UNLINK, "/tmp/halcode_app/ready.txt", 0, 0, 0, 0)
+        SystemCall(CCSys.SYS_UNLINK, "/tmp/halcode_app/host.port", 0, 0, 0, 0)
+        CC_WriteStdout("[host] tools stopped\n")
+    }
+}
+
 // Persistent tool parent for the GTK desk. Same BootTools + AgentProxy as TUI.
-// Does not KillStaleTools — leftover --mcp on-demand workers stay alone.
+// Shutdown is the ctl port (127.0.0.1:47631, line "shutdown") or SIGTERM/SIGINT.
 Function.CC_RunHostMode {
     Body: {
         CC_ChdirToBinDir()
@@ -4335,39 +4756,30 @@ Function.CC_RunHostMode {
         CC_WriteStdout("[host] begin\n")
         History.Init()
         IPCDispatch.Init()
+        IPCDState.host_sig = CC_HostArmSig()
         CC_WriteStdout("[host] KillStaleTools\n")
         CC_KillStaleTools()
         CC_WriteStdout("[host] BootTools\n")
         CC_BootTools()
         CC_WriteStdout("[host] StartProxy\n")
         IPCDispatch.StartProxy()
+        IPCDState.host_ctl = CC_HostCtlOpen()
         CC_WriteAppFile("/tmp/halcode_app/ready.txt", "1")
         CC_WriteStdout("[host] ready.txt\n")
         CC_RestorePgmemUi(0)
         CC_WritePickupSnapshot()
         CC_WriteStdout("[host] pgmem pickup written\n")
-        ts = Allocate(16)
         WhileLoop 1 {
             IPCDispatch.PollProxy()
-            i = 0
-            WhileLoop LessThan(i, CCRunState.child_count) {
-                slot = Multiply(i, 8)
-                pid = Dereference(Add(CCRunState.child_pids, slot))
-                IfCondition GreaterThan(pid, 0) ThenBlock: {
-                    wstat = Allocate(8)
-                    StoreValue(wstat, 0)
-                    wr = SystemCall(CCSys.SYS_WAIT4, pid, wstat, 1, 0, 0)
-                    Deallocate(wstat, 8)
-                    IfCondition GreaterThan(wr, 0) ThenBlock: {
-                        StoreValue(Add(CCRunState.child_pids, slot), 0)
-                    }
-                }
-                i = Add(i, 1)
-            }
-            StoreValue(ts, 0)
-            StoreValue(Add(ts, 8), 16000000)
-            SystemCall(CCSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+            CC_ReapChildren()
+            IPCDispatch_ReapRespawns()
+            IfCondition EqualTo(IPCDispatch_HostCheck(16), 1) ThenBlock: { BreakLoop }
         }
+        IfCondition GreaterEqual(IPCDState.host_ctl, 0) ThenBlock: {
+            Socket.Close(IPCDState.host_ctl)
+            IPCDState.host_ctl = -1
+        }
+        CC_HostShutdown()
     }
 }
 
@@ -4577,7 +4989,6 @@ Function.CC_RunAgentMode {
     Input: prompt: Address
     Body: {
         CC_AgentLog("[worker] CC_RunAgentMode starting")
-        CCRunState.auto_approve = 1
 
         // Redirect stdout → /dev/null so all TUI/ANSI output is discarded
         devnull = SystemCall(CCSys.SYS_OPEN, "/dev/null", 2, 0, 0, 0)
@@ -5056,6 +5467,7 @@ Function.CC_MCP_HandleToolsList {
 Function.CC_MCP_BootSchemas {
     Body: {
         CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
+        MemorySet(CCRunState.child_pids, 0, Multiply(CCConst.MAX_CHILDREN, 8))
         CCRunState.child_count = 0
         MCPToolTable.entries = Allocate(768)   // 32 slots × 24 bytes
         MemorySet(MCPToolTable.entries, 0, 768)
@@ -5356,882 +5768,6 @@ Function.CC_RunMCPMode {
 }
 
 // =============================================================================
-// WEB API MODE — ./HalCode9000.x --serve [--port N]
-// Phase 1: GET /healthz + POST /v1/chat (SSE). Reuses the existing --agent
-// loop by spawning a worker child per turn. Self-contained tool parent (same
-// boot path as --host): boot tools, start AgentProxy, serve HTTP.
-// =============================================================================
-Function.CC_Serve_WriteStr {
-    Input: fd: Integer
-    Input: s: Address
-    Body: {
-        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
-        slen = StringLength(s)
-        IfCondition GreaterThan(slen, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_WRITE, fd, s, slen, 0, 0)
-        }
-    }
-}
-
-Function.CC_Serve_SendEvent {
-    Input: fd: Integer
-    Input: event: Address
-    Input: data: Address
-    Body: {
-        ev = "event: "
-        ev = StringConcat(ev, event)
-        ev = StringConcat(ev, "\ndata: ")
-        ev = StringConcat(ev, data)
-        ev = StringConcat(ev, "\n\n")
-        CC_Serve_WriteStr(fd, ev)
-    }
-}
-
-Function.CC_Serve_SendResponse {
-    Input: fd: Integer
-    Input: status_line: Address
-    Input: content_type: Address
-    Input: body: Address
-    Body: {
-        blen = StringLength(body)
-        r = "HTTP/1.1 "
-        r = StringConcat(r, status_line)
-        r = StringConcat(r, "\r\nContent-Type: ")
-        r = StringConcat(r, content_type)
-        r = StringConcat(r, "\r\nContent-Length: ")
-        r = StringConcat(r, NumberToString(blen))
-        r = StringConcat(r, "\r\nConnection: close\r\n\r\n")
-        r = StringConcat(r, body)
-        CC_Serve_WriteStr(fd, r)
-    }
-}
-
-Function.CC_Serve_GetContentLength {
-    Input: headers: Address
-    Output: Integer
-    Body: {
-        p = StringIndexOf(headers, "Content-Length:")
-        IfCondition LessThan(p, 0) ThenBlock: {
-            p = StringIndexOf(headers, "content-length:")
-        }
-        IfCondition LessThan(p, 0) ThenBlock: { ReturnValue(0) }
-        p = Add(p, 15)
-        WhileLoop EqualTo(GetByte(headers, p), 32) {
-            p = Add(p, 1)
-        }
-        val = 0
-        WhileLoop 1 {
-            c = GetByte(headers, p)
-            IfCondition Or(LessThan(c, 48), GreaterThan(c, 57)) ThenBlock: { BreakLoop }
-            val = Add(Multiply(val, 10), Subtract(c, 48))
-            p = Add(p, 1)
-        }
-        ReturnValue(val)
-    }
-}
-
-Function.CC_Serve_ReadRequest {
-    Input: fd: Integer
-    Input: buf: Address
-    Input: buf_size: Integer
-    Output: Integer
-    Body: {
-        total = 0
-        header_end = -1
-        content_len = 0
-        WhileLoop LessThan(total, Subtract(buf_size, 1)) {
-            n = SystemCall(CCSys.SYS_READ, fd, Add(buf, total), Subtract(Subtract(buf_size, 1), total), 0, 0)
-            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
-            total = Add(total, n)
-            SetByte(buf, total, 0)
-            header_end = StringIndexOf(buf, "\r\n\r\n")
-            IfCondition GreaterEqual(header_end, 0) ThenBlock: {
-                content_len = CC_Serve_GetContentLength(buf)
-                body_start = Add(header_end, 4)
-                IfCondition GreaterEqual(total, Add(body_start, content_len)) ThenBlock: {
-                    BreakLoop
-                }
-            }
-        }
-        SetByte(buf, total, 0)
-        ReturnValue(total)
-    }
-}
-
-Function.CC_Serve_RunAgent {
-    Input: spec: Address
-    Input: prompt: Address
-    Input: out_buf: Address
-    Input: out_max: Integer
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(spec, 0) ThenBlock: { spec = "deepseek" }
-
-        in_path = "/tmp/hal_serve_in.txt"
-        out_path = "/tmp/hal_serve_out.txt"
-        log_path = "/tmp/hal_serve.log"
-
-        fd = SystemCall(CCSys.SYS_OPEN, in_path, 577, 384, 0, 0)
-        IfCondition GreaterEqual(fd, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_WRITE, fd, prompt, StringLength(prompt), 0, 0)
-            SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
-        }
-        SystemCall(CCSys.SYS_UNLINK, out_path, 0, 0, 0, 0)
-
-        envp = CC_BuildInheritedEnvp()
-
-        cmd = "timeout 300 ./HalCode9000.x --agent "
-        cmd = StringConcat(cmd, spec)
-        cmd = StringConcat(cmd, " < ")
-        cmd = StringConcat(cmd, in_path)
-        cmd = StringConcat(cmd, " > ")
-        cmd = StringConcat(cmd, out_path)
-        cmd = StringConcat(cmd, " 2>>")
-        cmd = StringConcat(cmd, log_path)
-
-        pid = SystemCall(CCSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0), "/bin/sh")
-            StoreValue(Add(argv, 8), "-c")
-            StoreValue(Add(argv, 16), cmd)
-            StoreValue(Add(argv, 24), 0)
-            SystemCall(CCSys.SYS_EXECVE, "/bin/sh", argv, envp)
-            SystemCall(CCSys.SYS_EXIT, 1, 0, 0, 0, 0)
-        }
-
-        wstat = Allocate(8)
-        StoreValue(wstat, 0)
-        SystemCall(CCSys.SYS_WAIT4, pid, wstat, 0, 0, 0)
-        Deallocate(wstat, 8)
-
-        n = 0
-        ofd = SystemCall(CCSys.SYS_OPEN, out_path, 0, 0, 0, 0)
-        IfCondition GreaterEqual(ofd, 0) ThenBlock: {
-            n = SystemCall(CCSys.SYS_READ, ofd, out_buf, Subtract(out_max, 1), 0, 0)
-            SystemCall(CCSys.SYS_CLOSE, ofd, 0, 0, 0, 0)
-        }
-        IfCondition LessThan(n, 0) ThenBlock: { n = 0 }
-        SetByte(out_buf, n, 0)
-        ReturnValue(n)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// AUTH — bearer token for --serve mode. Precedence: --token arg -> env
-// HALBOT_SERVE_TOKEN -> ~/.halcode/keys.env (HALBOT_SERVE_TOKEN=...). If none
-// exist, generate one, persist it to ~/.halcode/keys.env (mode 0600), and
-// print it to stdout once at boot so the operator can copy it.
-// ---------------------------------------------------------------------------
-Function.CC_Serve_KeysEnvPath {
-    Output: Address
-    Body: {
-        home = CC_GetEnv("HOME")
-        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
-        ReturnValue(StringConcat(home, "/.halcode/keys.env"))
-    }
-}
-
-Function.CC_Serve_ReadKeysEnvToken {
-    Input: path: Address
-    Output: Address
-    Body: {
-        fd = SystemCall(CCSys.SYS_OPEN, path, 0, 0, 0, 0)
-        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
-        buf = Allocate(16384)
-        n = SystemCall(CCSys.SYS_READ, fd, buf, 16383, 0, 0)
-        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
-        IfCondition LessEqual(n, 0) ThenBlock: {
-            Deallocate(buf, 16384)
-            ReturnValue(0)
-        }
-        SetByte(buf, n, 0)
-        name = "HALBOT_SERVE_TOKEN="
-        CC_WriteStdout("[dbg] name_literal=[")
-        CC_WriteStdout(name)
-        CC_WriteStdout("]\n")
-        p = StringIndexOf(buf, name)
-        CC_WriteStdout("[dbg] n=")
-        CC_WriteStdout(NumberToString(n))
-        CC_WriteStdout(" name_len=")
-        CC_WriteStdout(NumberToString(StringLength(name)))
-        CC_WriteStdout(" p=")
-        CC_WriteStdout(NumberToString(p))
-        CC_WriteStdout("\n")
-        IfCondition GreaterEqual(p, 0) ThenBlock: {
-            ctx_len = 40
-            ctx_end = Add(p, ctx_len)
-            IfCondition GreaterThan(ctx_end, n) ThenBlock: { ctx_end = n }
-            ctx_start = p
-            IfCondition LessThan(ctx_start, 0) ThenBlock: { ctx_start = 0 }
-            ctxlen = Subtract(ctx_end, ctx_start)
-            ctxbuf = Allocate(Add(ctxlen, 1))
-            zz = 0
-            WhileLoop LessThan(zz, ctxlen) {
-                SetByte(ctxbuf, zz, GetByte(buf, Add(ctx_start, zz)))
-                zz = Add(zz, 1)
-            }
-            SetByte(ctxbuf, ctxlen, 0)
-            CC_WriteStdout("[dbg] buf@p..p+40=[")
-            CC_WriteStdout(ctxbuf)
-            CC_WriteStdout("]\n")
-            Deallocate(ctxbuf, Add(ctxlen, 1))
-        }
-        IfCondition LessThan(p, 0) ThenBlock: {
-            Deallocate(buf, 16384)
-            ReturnValue(0)
-        }
-        val_start = Add(p, StringLength(name))
-        val_end = val_start
-        WhileLoop LessThan(val_end, n) {
-            c = GetByte(buf, val_end)
-            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 10) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 13) ThenBlock: { BreakLoop }
-            val_end = Add(val_end, 1)
-        }
-        len = Subtract(val_end, val_start)
-        IfCondition LessEqual(len, 0) ThenBlock: {
-            Deallocate(buf, 16384)
-            ReturnValue(0)
-        }
-        out = Allocate(Add(len, 1))
-        k = 0
-        WhileLoop LessThan(k, len) {
-            SetByte(out, k, GetByte(buf, Add(val_start, k)))
-            k = Add(k, 1)
-        }
-        SetByte(out, len, 0)
-        Deallocate(buf, 16384)
-        ReturnValue(out)
-    }
-}
-
-Function.CC_Serve_AppendKeysEnv {
-    Input: path: Address
-    Input: line: Address
-    Body: {
-        fd = SystemCall(CCSys.SYS_OPEN, path, 1089, 384, 0, 0)
-        IfCondition GreaterEqual(fd, 0) ThenBlock: {
-            SystemCall(CCSys.SYS_WRITE, fd, line, StringLength(line), 0, 0)
-            SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
-        }
-    }
-}
-
-Function.CC_Serve_GenerateToken {
-    Output: Address
-    Body: {
-        ts = SystemCall(CCSys.SYS_TIME, 0, 0, 0, 0, 0)
-        r1 = CC_RandomUint16()
-        r2 = CC_RandomUint16()
-        r3 = CC_RandomUint16()
-        r4 = CC_RandomUint16()
-        tok = "hb-"
-        tok = StringConcat(tok, NumberToString(ts))
-        tok = StringConcat(tok, "-")
-        tok = StringConcat(tok, NumberToString(r1))
-        tok = StringConcat(tok, NumberToString(r2))
-        tok = StringConcat(tok, NumberToString(r3))
-        tok = StringConcat(tok, NumberToString(r4))
-        ReturnValue(tok)
-    }
-}
-
-Function.CC_Serve_LoadOrCreateToken {
-    Output: Address
-    Body: {
-        t = CC_ReadArgValue("--token")
-        IfCondition NotEqual(t, 0) ThenBlock: {
-            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: {
-                CC_WriteStdout("[dbg] branch=ARG len=")
-                CC_WriteStdout(NumberToString(StringLength(t)))
-                CC_WriteStdout("\n")
-                ReturnValue(t)
-            }
-        }
-        t = CC_GetEnv("HALBOT_SERVE_TOKEN")
-        IfCondition NotEqual(t, 0) ThenBlock: {
-            IfCondition GreaterThan(StringLength(t), 0) ThenBlock: {
-                CC_WriteStdout("[dbg] branch=ENV len=")
-                CC_WriteStdout(NumberToString(StringLength(t)))
-                CC_WriteStdout("\n")
-                ReturnValue(t)
-            }
-        }
-        path = CC_Serve_KeysEnvPath()
-        CC_WriteStdout("[dbg] keys.env path=")
-        CC_WriteStdout(path)
-        CC_WriteStdout("\n")
-        t = CC_Serve_ReadKeysEnvToken(path)
-        IfCondition NotEqual(t, 0) ThenBlock: {
-            CC_WriteStdout("[dbg] branch=FILE len=")
-            CC_WriteStdout(NumberToString(StringLength(t)))
-            CC_WriteStdout("\n")
-            ReturnValue(t)
-        }
-
-        CC_WriteStdout("[dbg] branch=GENERATE\n")
-        t = CC_Serve_GenerateToken()
-        home = CC_GetEnv("HOME")
-        IfCondition EqualTo(home, 0) ThenBlock: { home = "/root" }
-        haldir = StringConcat(home, "/.halcode")
-        SystemCall(CCSys.SYS_MKDIR, haldir, 448, 0, 0, 0)
-        line = "HALBOT_SERVE_TOKEN="
-        line = StringConcat(line, t)
-        line = StringConcat(line, "\n")
-        CC_Serve_AppendKeysEnv(path, line)
-        ReturnValue(t)
-    }
-}
-
-// Returns 1 if the request carries a matching "Authorization: Bearer <t>".
-// Sends a 401 and returns 0 otherwise. An empty expected token disables auth.
-Function.CC_Serve_CheckAuth {
-    Input: fd: Integer
-    Input: buf: Address
-    Input: expected: Address
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(expected, 0) ThenBlock: { ReturnValue(1) }
-        IfCondition LessEqual(StringLength(expected), 0) ThenBlock: { ReturnValue(1) }
-
-        hdr = StringIndexOf(buf, "Authorization:")
-        IfCondition LessThan(hdr, 0) ThenBlock: {
-            hdr = StringIndexOf(buf, "authorization:")
-        }
-        IfCondition LessThan(hdr, 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"missing authorization header\"}")
-            ReturnValue(0)
-        }
-
-        val_pos = Add(hdr, 14)
-        WhileLoop EqualTo(GetByte(buf, val_pos), 32) {
-            val_pos = Add(val_pos, 1)
-        }
-
-        scheme = StringSubstring(buf, val_pos, Add(val_pos, 7))
-        IfCondition NotEqual(StringCompare(scheme, "Bearer "), 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"unsupported auth scheme\"}")
-            ReturnValue(0)
-        }
-
-        tok_start = Add(val_pos, 7)
-        tok_end = tok_start
-        WhileLoop 1 {
-            c = GetByte(buf, tok_end)
-            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 13) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 10) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 32) ThenBlock: { BreakLoop }
-            tok_end = Add(tok_end, 1)
-        }
-        tok = StringSubstring(buf, tok_start, tok_end)
-        IfCondition NotEqual(StringCompare(tok, expected), 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "401 Unauthorized", "application/json", "{\"ok\":false,\"error\":\"invalid token\"}")
-            ReturnValue(0)
-        }
-        ReturnValue(1)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// SESSIONS — persisted via Pgmem (session:<sid>:meta + session:<sid>:history),
-// the same keys the TUI/GUI use, so a --serve session is resumable anywhere.
-// ---------------------------------------------------------------------------
-
-// Ensure a session exists (create an empty one if it doesn't). Returns 1.
-Function.CC_Serve_EnsureSession {
-    Input: sid: Address
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(sid, 0) ThenBlock: { ReturnValue(0) }
-        m_key = StringConcat("session:", sid)
-        m_key = StringConcat(m_key, ":meta")
-        args = JSON.NewObject()
-        JSON.SetString(args, "op", "pickup")
-        JSON.SetString(args, "key", m_key)
-        perr = Allocate(8)
-        StoreValue(perr, 0, "dword")
-        resp = IPCDispatch.Dispatch("Pgmem", args, 0, perr)
-        err = Dereference(perr, "dword")
-        Deallocate(perr, 8)
-        IfCondition And(EqualTo(err, 0), NotEqual(resp, 0)) ThenBlock: {
-            IfCondition GreaterThan(StringLength(resp), 0) ThenBlock: { ReturnValue(1) }
-        }
-        History.Clear()
-        History.SetSessionID(sid)
-        History.SetTitle("New Session")
-        CC_SaveSessionToPgmem()
-        ReturnValue(1)
-    }
-}
-
-// Run one chat turn for a session (create a new one if sid==0) and emit SSE.
-Function.CC_Serve_RunChatTurn {
-    Input: fd: Integer
-    Input: body_ptr: Address
-    Input: sid: Address
-    Body: {
-        msg = ""
-        prov = 0
-        model = 0
-        IfCondition NotEqual(body_ptr, 0) ThenBlock: {
-            parsed = ParseJSON(body_ptr)
-            IfCondition NotEqual(parsed, 0) ThenBlock: {
-                obj = JSON.AsObject(parsed)
-                IfCondition NotEqual(obj, 0) ThenBlock: {
-                    m = JSON.GetString(obj, "message")
-                    IfCondition NotEqual(m, 0) ThenBlock: { msg = m }
-                    prov = JSON.GetString(obj, "provider")
-                    model = JSON.GetString(obj, "model")
-                }
-            }
-        }
-
-        IfCondition EqualTo(StringLength(msg), 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"missing message\"}")
-            ReturnValue(0)
-        }
-
-        spec = 0
-        IfCondition And(NotEqual(prov, 0), NotEqual(model, 0)) ThenBlock: {
-            spec = StringConcat(prov, ":")
-            spec = StringConcat(spec, model)
-        } ElseBlock: {
-            IfCondition NotEqual(prov, 0) ThenBlock: {
-                spec = prov
-            } ElseBlock: {
-                spec = CC_ResolveWorkerSpec()
-            }
-        }
-
-        // Decide + persist the session before spawning the worker so the
-        // --agent child resumes exactly this session (CC_GuiApplySession reads
-        // /tmp/halcode_app/session.txt). nopickup.txt suppresses the desktop
-        // working_state recap from being prepended to the prompt.
-        IfCondition EqualTo(sid, 0) ThenBlock: {
-            sid = CC_GenerateSessionGUID()
-        }
-        CC_Serve_EnsureSession(sid)
-        CC_WriteAppFile("/tmp/halcode_app/session.txt", sid)
-        CC_WriteAppFile("/tmp/halcode_app/nopickup.txt", sid)
-
-        CC_Serve_WriteStr(fd, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n")
-
-        sobj = JSON.NewObject()
-        JSON.SetString(sobj, "session_id", sid)
-        JSON.SetString(sobj, "model", spec)
-        CC_Serve_SendEvent(fd, "session", JSON.SerializeObject(sobj))
-
-        out_buf = Allocate(1048576)
-        n = CC_Serve_RunAgent(spec, msg, out_buf, 1048576)
-
-        IfCondition GreaterThan(n, 0) ThenBlock: {
-            tobj = JSON.NewObject()
-            JSON.SetString(tobj, "text", out_buf)
-            CC_Serve_SendEvent(fd, "text_delta", JSON.SerializeObject(tobj))
-        }
-
-        dobj = JSON.NewObject()
-        JSON.SetString(dobj, "stop_reason", "end_turn")
-        CC_Serve_SendEvent(fd, "turn_done", JSON.SerializeObject(dobj))
-    }
-}
-
-Function.CC_Serve_HandleChat {
-    Input: fd: Integer
-    Input: body_ptr: Address
-    Body: {
-        CC_Serve_RunChatTurn(fd, body_ptr, 0)
-    }
-}
-
-Function.CC_Serve_HandleTools {
-    Input: fd: Integer
-    Body: {
-        schemas = IPCDispatch.GetToolSchemasArray()
-        resp = JSON.NewObject()
-        JSON.SetArray(resp, "tools", schemas)
-        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(resp))
-    }
-}
-
-Function.CC_Serve_HandleSessionsList {
-    Input: fd: Integer
-    Body: {
-        args = JSON.NewObject()
-        JSON.SetString(args, "op", "search")
-        JSON.SetString(args, "query", "session:")
-        JSON.SetString(args, "kind", "session_meta")
-        JSON.SetString(args, "scope", "persistent")
-        perr = Allocate(8)
-        StoreValue(perr, 0, "dword")
-        resp = IPCDispatch.Dispatch("Pgmem", args, 0, perr)
-        err = Dereference(perr, "dword")
-        Deallocate(perr, 8)
-
-        out = JSON.NewObject()
-        out_arr = JSON.NewArray()
-        IfCondition And(EqualTo(err, 0), NotEqual(resp, 0)) ThenBlock: {
-            parsed = JSON.AsObject(ParseJSON(resp))
-            IfCondition NotEqual(parsed, 0) ThenBlock: {
-                rows = JSON.GetArray(parsed, "rows")
-                IfCondition NotEqual(rows, 0) ThenBlock: {
-                    n_rows = JSON.ArrayLength(rows)
-                    i = 0
-                    WhileLoop LessThan(i, n_rows) {
-                        row = JSON.AsObject(JSON.ArrayGet(rows, i))
-                        IfCondition NotEqual(row, 0) ThenBlock: {
-                            key = JSON.GetString(row, "key")
-                            IfCondition NotEqual(key, 0) ThenBlock: {
-                                klen = StringLength(key)
-                                IfCondition GreaterThan(klen, 5) ThenBlock: {
-                                    sub_pos = Subtract(klen, 5)
-                                    IfCondition EqualTo(StringCompare(Add(key, sub_pos), ":meta"), 0) ThenBlock: {
-                                        content_str = JSON.GetString(row, "content")
-                                        IfCondition NotEqual(content_str, 0) ThenBlock: {
-                                            m_obj = JSON.AsObject(ParseJSON(content_str))
-                                            IfCondition NotEqual(m_obj, 0) ThenBlock: {
-                                                del = JSON.GetString(m_obj, "deleted")
-                                                IfCondition EqualTo(del, 0) ThenBlock: {
-                                                    JSON.PushObject(out_arr, m_obj)
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        i = Add(i, 1)
-                    }
-                }
-            }
-        }
-        JSON.SetArray(out, "sessions", out_arr)
-        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(out))
-    }
-}
-
-Function.CC_Serve_HandleSessionGet {
-    Input: fd: Integer
-    Input: sid: Address
-    Body: {
-        m_key = StringConcat("session:", sid)
-        m_key = StringConcat(m_key, ":meta")
-        m_args = JSON.NewObject()
-        JSON.SetString(m_args, "op", "pickup")
-        JSON.SetString(m_args, "key", m_key)
-        perr = Allocate(8)
-        StoreValue(perr, 0, "dword")
-        m_resp = IPCDispatch.Dispatch("Pgmem", m_args, 0, perr)
-        err = Dereference(perr, "dword")
-        Deallocate(perr, 8)
-        IfCondition Or(EqualTo(err, 1), EqualTo(m_resp, 0)) ThenBlock: {
-            CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"session not found\"}")
-            ReturnValue(0)
-        }
-        meta_obj = JSON.AsObject(ParseJSON(m_resp))
-        IfCondition EqualTo(meta_obj, 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "500 Internal Server Error", "application/json", "{\"ok\":false,\"error\":\"bad meta\"}")
-            ReturnValue(0)
-        }
-        del = JSON.GetString(meta_obj, "deleted")
-        IfCondition NotEqual(del, 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"session deleted\"}")
-            ReturnValue(0)
-        }
-
-        h_key = StringConcat("session:", sid)
-        h_key = StringConcat(h_key, ":history")
-        h_args = JSON.NewObject()
-        JSON.SetString(h_args, "op", "pickup")
-        JSON.SetString(h_args, "key", h_key)
-        perr2 = Allocate(8)
-        StoreValue(perr2, 0, "dword")
-        h_resp = IPCDispatch.Dispatch("Pgmem", h_args, 0, perr2)
-        err2 = Dereference(perr2, "dword")
-        Deallocate(perr2, 8)
-        hist_arr = 0
-        IfCondition And(EqualTo(err2, 0), NotEqual(h_resp, 0)) ThenBlock: {
-            hist_arr = JSON.AsArray(ParseJSON(h_resp))
-        }
-        IfCondition EqualTo(hist_arr, 0) ThenBlock: { hist_arr = JSON.NewArray() }
-
-        t_args = JSON.NewObject()
-        JSON.SetString(t_args, "op", "task_list")
-        JSON.SetString(t_args, "session_id", sid)
-        perr3 = Allocate(8)
-        StoreValue(perr3, 0, "dword")
-        t_resp = IPCDispatch.Dispatch("Pgmem", t_args, 0, perr3)
-        err3 = Dereference(perr3, "dword")
-        Deallocate(perr3, 8)
-        tasks_arr = 0
-        IfCondition And(EqualTo(err3, 0), NotEqual(t_resp, 0)) ThenBlock: {
-            t_obj = JSON.AsObject(ParseJSON(t_resp))
-            IfCondition NotEqual(t_obj, 0) ThenBlock: {
-                tasks_arr = JSON.GetArray(t_obj, "tasks")
-            }
-        }
-        IfCondition EqualTo(tasks_arr, 0) ThenBlock: { tasks_arr = JSON.NewArray() }
-
-        JSON.SetArray(meta_obj, "history", hist_arr)
-        JSON.SetArray(meta_obj, "tasks", tasks_arr)
-        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(meta_obj))
-    }
-}
-
-Function.CC_Serve_HandleSessionDelete {
-    Input: fd: Integer
-    Input: sid: Address
-    Body: {
-        del_meta = JSON.NewObject()
-        JSON.SetString(del_meta, "id", sid)
-        JSON.SetString(del_meta, "title", "Deleted Session")
-        JSON.SetString(del_meta, "deleted", "true")
-
-        m_key = StringConcat("session:", sid)
-        m_key = StringConcat(m_key, ":meta")
-        m_args = JSON.NewObject()
-        JSON.SetString(m_args, "op", "park")
-        JSON.SetString(m_args, "key", m_key)
-        JSON.SetString(m_args, "kind", "session_meta")
-        JSON.SetString(m_args, "scope", "persistent")
-        JSON.SetString(m_args, "content", JSON.SerializeObject(del_meta))
-        perr = Allocate(8)
-        StoreValue(perr, 0, "dword")
-        IPCDispatch.Dispatch("Pgmem", m_args, 0, perr)
-        Deallocate(perr, 8)
-
-        h_key = StringConcat("session:", sid)
-        h_key = StringConcat(h_key, ":history")
-        h_args = JSON.NewObject()
-        JSON.SetString(h_args, "op", "park")
-        JSON.SetString(h_args, "key", h_key)
-        JSON.SetString(h_args, "kind", "session_history")
-        JSON.SetString(h_args, "scope", "persistent")
-        JSON.SetString(h_args, "content", "[]")
-        perr2 = Allocate(8)
-        StoreValue(perr2, 0, "dword")
-        IPCDispatch.Dispatch("Pgmem", h_args, 0, perr2)
-        Deallocate(perr2, 8)
-
-        out = JSON.NewObject()
-        JSON.SetBool(out, "ok", 1)
-        JSON.SetString(out, "deleted", sid)
-        CC_Serve_SendResponse(fd, "200 OK", "application/json", JSON.SerializeObject(out))
-    }
-}
-
-Function.CC_Serve_HandleSessionMessages {
-    Input: fd: Integer
-    Input: body_ptr: Address
-    Input: sid: Address
-    Body: {
-        CC_Serve_RunChatTurn(fd, body_ptr, sid)
-    }
-}
-
-// Parse "/v1/sessions/<id>[/messages]" — copies <id> into out (NUL-terminated).
-Function.CC_Serve_ParseSessionPath {
-    Input: path: Address
-    Input: out: Address
-    Output: Integer
-    Body: {
-        prefix = "/v1/sessions/"
-        IfCondition NotEqual(StringIndexOf(path, prefix), 0) ThenBlock: { ReturnValue(0) }
-        start = 13
-        end = start
-        WhileLoop 1 {
-            c = GetByte(path, end)
-            IfCondition EqualTo(c, 0) ThenBlock: { BreakLoop }
-            IfCondition EqualTo(c, 47) ThenBlock: { BreakLoop }
-            end = Add(end, 1)
-        }
-        id_len = Subtract(end, start)
-        IfCondition LessEqual(id_len, 0) ThenBlock: { ReturnValue(0) }
-        k = 0
-        WhileLoop LessThan(k, id_len) {
-            SetByte(out, k, GetByte(path, Add(start, k)))
-            k = Add(k, 1)
-        }
-        SetByte(out, id_len, 0)
-        ReturnValue(1)
-    }
-}
-
-// 1 if path is "/v1/sessions/<id>/messages", else 0.
-Function.CC_Serve_IsMessagesPath {
-    Input: path: Address
-    Output: Integer
-    Body: {
-        plen = StringLength(path)
-        IfCondition LessThan(plen, 9) ThenBlock: { ReturnValue(0) }
-        pos = Subtract(plen, 9)
-        IfCondition EqualTo(StringCompare(Add(path, pos), "/messages"), 0) ThenBlock: { ReturnValue(1) }
-        ReturnValue(0)
-    }
-}
-
-Function.CC_Serve_HandleClient {
-    Input: fd: Integer
-    Input: buf: Address
-    Input: buf_size: Integer
-    Body: {
-        total = CC_Serve_ReadRequest(fd, buf, buf_size)
-        IfCondition LessEqual(total, 0) ThenBlock: { ReturnValue(0) }
-
-        sp = StringIndexOf(buf, " ")
-        IfCondition LessThan(sp, 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false}")
-            ReturnValue(0)
-        }
-
-        method = StringSubstring(buf, 0, sp)
-        rest_start = Add(sp, 1)
-        sp2 = StringIndexOf(Add(buf, rest_start), " ")
-        IfCondition LessThan(sp2, 0) ThenBlock: {
-            CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false}")
-            ReturnValue(0)
-        }
-        path_end = Add(rest_start, sp2)
-        path = StringSubstring(buf, rest_start, path_end)
-
-        header_end = StringIndexOf(buf, "\r\n\r\n")
-        body_ptr = 0
-        IfCondition GreaterEqual(header_end, 0) ThenBlock: {
-            body_ptr = Add(buf, Add(header_end, 4))
-        }
-
-        is_get = StringCompare(method, "GET")
-        is_post = StringCompare(method, "POST")
-        is_delete = StringCompare(method, "DELETE")
-
-        // Liveness is unauthenticated; everything else requires the bearer.
-        IfCondition And(EqualTo(StringCompare(path, "/healthz"), 0), EqualTo(is_get, 0)) ThenBlock: {
-            CC_Serve_SendResponse(fd, "200 OK", "application/json", "{\"ok\":true}")
-            ReturnValue(0)
-        }
-
-        IfCondition EqualTo(CC_Serve_CheckAuth(fd, buf, CCRunState.serve_token), 0) ThenBlock: {
-            ReturnValue(0)
-        }
-
-        IfCondition And(EqualTo(StringCompare(path, "/v1/tools"), 0), EqualTo(is_get, 0)) ThenBlock: {
-            CC_Serve_HandleTools(fd)
-            ReturnValue(0)
-        }
-
-        IfCondition And(EqualTo(StringCompare(path, "/v1/chat"), 0), EqualTo(is_post, 0)) ThenBlock: {
-            CC_Serve_HandleChat(fd, body_ptr)
-            ReturnValue(0)
-        }
-
-        IfCondition And(EqualTo(StringCompare(path, "/v1/sessions"), 0), EqualTo(is_get, 0)) ThenBlock: {
-            CC_Serve_HandleSessionsList(fd)
-            ReturnValue(0)
-        }
-
-        IfCondition EqualTo(StringIndexOf(path, "/v1/sessions/"), 0) ThenBlock: {
-            sid = Allocate(256)
-            SetByte(sid, 0, 0)
-            IfCondition EqualTo(CC_Serve_ParseSessionPath(path, sid), 1) ThenBlock: {
-                IfCondition EqualTo(CC_Serve_IsMessagesPath(path), 1) ThenBlock: {
-                    IfCondition EqualTo(is_post, 0) ThenBlock: {
-                        CC_Serve_HandleSessionMessages(fd, body_ptr, sid)
-                    } ElseBlock: {
-                        CC_Serve_SendResponse(fd, "405 Method Not Allowed", "application/json", "{\"ok\":false,\"error\":\"use POST\"}")
-                    }
-                } ElseBlock: {
-                    IfCondition EqualTo(is_get, 0) ThenBlock: {
-                        CC_Serve_HandleSessionGet(fd, sid)
-                    } ElseBlock: {
-                        IfCondition EqualTo(is_delete, 0) ThenBlock: {
-                            CC_Serve_HandleSessionDelete(fd, sid)
-                        } ElseBlock: {
-                            CC_Serve_SendResponse(fd, "405 Method Not Allowed", "application/json", "{\"ok\":false,\"error\":\"method not allowed\"}")
-                        }
-                    }
-                }
-            } ElseBlock: {
-                CC_Serve_SendResponse(fd, "400 Bad Request", "application/json", "{\"ok\":false,\"error\":\"bad session path\"}")
-            }
-            Deallocate(sid, 256)
-            ReturnValue(0)
-        }
-
-        CC_Serve_SendResponse(fd, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"not found\"}")
-        ReturnValue(0)
-    }
-}
-
-Function.CC_RunServeMode {
-    Body: {
-        CC_ChdirToBinDir()
-        SystemCall(CCSys.SYS_MKDIR, "/tmp/halcode_app", 493, 0, 0, 0)
-        History.Init()
-        IPCDispatch.Init()
-        CC_KillStaleTools()
-        CC_BootTools()
-        IPCDispatch.StartProxy()
-        CC_RestorePgmemUi(0)
-
-        CCRunState.serve_token = CC_Serve_LoadOrCreateToken()
-        CC_WriteStdout("[serve] bearer token: ")
-        CC_WriteStdout(CCRunState.serve_token)
-        CC_WriteStdout("\n")
-
-        port = 8080
-        port_str = CC_ReadArgValue("--port")
-        IfCondition NotEqual(port_str, 0) ThenBlock: {
-            pv = StringToInt(port_str)
-            IfCondition GreaterThan(pv, 0) ThenBlock: { port = pv }
-        }
-
-        server_fd = Socket.Create(2, 1)
-        IfCondition LessThan(server_fd, 0) ThenBlock: {
-            CC_WriteStdout("[serve] socket create failed\n")
-            ReturnValue(0)
-        }
-
-        opt = Allocate(4)
-        StoreValue(opt, 1, "dword")
-        SystemCall(54, server_fd, 1, 2, opt, 4)
-        Deallocate(opt, 4)
-
-        addr = Socket.CreateAddr("127.0.0.1", port)
-        brc = SystemCall(49, server_fd, addr, 16, 0, 0)
-        Deallocate(addr, 16)
-        IfCondition LessThan(brc, 0) ThenBlock: {
-            CC_WriteStdout("[serve] bind failed (port busy?)\n")
-            Socket.Close(server_fd)
-            ReturnValue(0)
-        }
-
-        lrc = Socket.Listen(server_fd, 16)
-        IfCondition LessThan(lrc, 0) ThenBlock: {
-            CC_WriteStdout("[serve] listen failed\n")
-            Socket.Close(server_fd)
-            ReturnValue(0)
-        }
-
-        CC_WriteStdout("[serve] listening on 127.0.0.1:")
-        CC_WriteStdout(NumberToString(port))
-        CC_WriteStdout("\n")
-
-        buf = Allocate(65536)
-        WhileLoop 1 {
-            client_fd = Socket.Accept(server_fd)
-            IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
-                Socket.SetRecvTimeout(client_fd, 30000)
-                CC_Serve_HandleClient(client_fd, buf, 65536)
-                Socket.Close(client_fd)
-            }
-        }
-    }
-}
-
-// =============================================================================
 // MAIN
 // =============================================================================
 SubRoutine.Main {
@@ -6295,22 +5831,6 @@ SubRoutine.Main {
             SystemCall(CCSys.SYS_CLOSE, saved_out, 0, 0, 0, 0)
         }
         CC_RunMCPMode()
-        SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
-    }
-
-    // Web API mode: ./HalCode9000.x --serve [--port N]
-    // Self-contained HTTP+SSE backend; boots tools + AgentProxy like --host.
-    serve_flag = CC_HasArg("--serve")
-    IfCondition EqualTo(serve_flag, 1) ThenBlock: {
-        serve_sig = Allocate(32)
-        StoreValue(Add(serve_sig, 0), 0)
-        StoreValue(Add(serve_sig, 8), 0)
-        StoreValue(Add(serve_sig, 16), 0)
-        StoreValue(Add(serve_sig, 24), 0)
-        SystemCall(13, 2, serve_sig, 0, 8, 0)
-        SystemCall(13, 15, serve_sig, 0, 8, 0)
-        Deallocate(serve_sig, 32)
-        CC_RunServeMode()
         SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
     }
 

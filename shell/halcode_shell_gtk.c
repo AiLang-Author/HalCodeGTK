@@ -25,6 +25,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -242,6 +245,82 @@ static int host_ready(void) {
     return access("/tmp/halcode_app/ready.txt", F_OK) == 0;
 }
 
+/* Parent death delivers SIGTERM. Covers a shell that is killed without on_quit. */
+static void die_with_parent(void) {
+    if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0)
+        _exit(127);
+    if (getppid() == 1)
+        _exit(127);
+}
+
+/* Ask HalCode9000.x --host to kill its tools and exit. Port file is host.port. */
+static int host_request_shutdown(void) {
+    FILE *f;
+    int port = 0, fd, n;
+    char buf[32];
+    struct sockaddr_in a;
+    struct timeval tv;
+
+    f = fopen("/tmp/halcode_app/host.port", "r");
+    if (!f)
+        return -1;
+    if (fscanf(f, "%d", &port) != 1)
+        port = 0;
+    fclose(f);
+    if (port <= 0 || port > 65535)
+        return -1;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0)
+        return -1;
+    memset(&a, 0, sizeof a);
+    a.sin_family = AF_INET;
+    a.sin_port = htons((unsigned short)port);
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    tv.tv_sec = 2;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    if (connect(fd, (struct sockaddr *)&a, sizeof a) != 0) {
+        close(fd);
+        return -1;
+    }
+    if (send(fd, "shutdown\n", 9, MSG_NOSIGNAL) != 9) {
+        close(fd);
+        return -1;
+    }
+    n = (int)recv(fd, buf, sizeof buf, 0);
+    close(fd);
+    return n > 0 ? 0 : -1;
+}
+
+/* Wait until pid exits. SIGKILL if it is still alive after ~5s. */
+static void reap_pid(pid_t *pp) {
+    int st, i;
+    pid_t p;
+
+    if (!pp || *pp <= 0)
+        return;
+    p = *pp;
+    for (i = 0; i < 250; i++) {
+        if (waitpid(p, &st, WNOHANG) == p) {
+            *pp = -1;
+            return;
+        }
+        usleep(20000);
+    }
+    kill(p, SIGKILL);
+    waitpid(p, &st, 0);
+    *pp = -1;
+}
+
+static void stop_host(void) {
+    if (g_host <= 0)
+        return;
+    if (host_request_shutdown() != 0)
+        kill(g_host, SIGTERM);
+    reap_pid(&g_host);
+}
+
 static void ensure_host(void) {
     char cmd[512];
     int st;
@@ -266,6 +345,7 @@ static void ensure_host(void) {
     dbg("fork host");
     g_host = fork();
     if (g_host == 0) {
+        die_with_parent();
         if (chdir(g_app_root) != 0) _exit(127);
         snprintf(cmd, sizeof cmd,
             "exec ./HalCode9000.x --host >>/tmp/halcode_app/host.log 2>&1");
@@ -320,6 +400,7 @@ static void agent_tick(void) {
         if (!spec[0]) snprintf(spec, sizeof spec, "deepseek");
         g_agent = fork();
         if (g_agent == 0) {
+            die_with_parent();
             if (chdir(g_app_root) != 0) _exit(127);
             snprintf(cmd, sizeof cmd,
                 "k=\"$HOME/.halcode\"; set -a; "
@@ -660,10 +741,10 @@ static void on_quit(GtkWidget *w, gpointer data) {
         return;
     g_quitting = 1;
     write_cmd("quit");
-    if (g_host > 0) {
-        kill(g_host, SIGTERM);
-        waitpid(g_host, NULL, 0);
-        g_host = -1;
+    stop_host();
+    if (g_agent > 0) {
+        kill(g_agent, SIGTERM);
+        reap_pid(&g_agent);
     }
     pf = fopen("/tmp/halcode_desk.pid", "r");
     if (pf) {
@@ -1027,10 +1108,10 @@ int main(int argc, char **argv) {
     gtk_main();
 
     write_cmd("quit");
-    if (g_host > 0) {
-        kill(g_host, SIGTERM);
-        waitpid(g_host, NULL, 0);
-        g_host = -1;
+    stop_host();
+    if (g_agent > 0) {
+        kill(g_agent, SIGTERM);
+        reap_pid(&g_agent);
     }
     if (g_surf) cairo_surface_destroy(g_surf);
     return 0;

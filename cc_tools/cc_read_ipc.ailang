@@ -51,6 +51,8 @@ FixedPool.CCReadState {
     "schema":        Initialize=0, CanChange=True
     "listen_fd":     Initialize=-1, CanChange=True
     "running":       Initialize=1, CanChange=True
+    "file_size":     Initialize=0, CanChange=True
+    "read_n":        Initialize=0, CanChange=True
 }
 
 // =============================================================================
@@ -164,6 +166,37 @@ Function.CCRead_DoRead {
             ReturnValue(0)
         }
 
+        st = Allocate(144)
+        fs = SystemCall(CCReadSys.SYS_FSTAT, fd, st, 0, 0, 0)
+        mode = 0
+        CCReadState.file_size = 0
+        IfCondition GreaterEqual(fs, 0) ThenBlock: {
+            mode = Add(GetByte(st, 24), Multiply(GetByte(st, 25), 256))
+            // st_size is an 8-byte off_t at offset 48. The low 32 bits cover
+            // any source file this tool will report.
+            CCReadState.file_size = GetByte(st, 48)
+            CCReadState.file_size = Add(CCReadState.file_size, Multiply(GetByte(st, 49), 256))
+            CCReadState.file_size = Add(CCReadState.file_size, Multiply(GetByte(st, 50), 65536))
+            CCReadState.file_size = Add(CCReadState.file_size, Multiply(GetByte(st, 51), 16777216))
+        }
+        Deallocate(st, 144)
+        IfCondition EqualTo(BitwiseAnd(mode, 61440), 16384) ThenBlock: {
+            SystemCall(CCReadSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            prefix = "is a directory: "
+            i = 0
+            WhileLoop LessThan(i, StringLength(prefix)) {
+                SetByte(err_buf, i, GetByte(prefix, i))
+                i = Add(i, 1)
+            }
+            j = 0
+            WhileLoop LessThan(j, StringLength(path)) {
+                SetByte(err_buf, Add(i, j), GetByte(path, j))
+                j = Add(j, 1)
+            }
+            SetByte(err_buf, Add(i, j), 0)
+            ReturnValue(0)
+        }
+
         IfCondition GreaterThan(offset, 0) ThenBlock: {
             SystemCall(CCReadSys.SYS_LSEEK, fd, offset, 0, 0, 0)
         }
@@ -182,6 +215,7 @@ Function.CCRead_DoRead {
             total = Add(total, n)
         }
         SetByte(buf, total, 0)
+        CCReadState.read_n = total
 
         // Try one more byte to see if there's more — if so, mark truncated.
         IfCondition EqualTo(limit, 0) ThenBlock: {
@@ -315,7 +349,10 @@ Function.CCRead_HandleRequest {
             } ElseBlock: {
                 // If truncated, append a marker line to content
                 IfCondition EqualTo(truncated, 1) ThenBlock: {
-                    marker = "\n[truncated: more bytes available]"
+                    marker = StringConcat("\n[truncated at ", NumberToString(CCReadState.read_n))
+                    marker = StringConcat(marker, " of ")
+                    marker = StringConcat(marker, NumberToString(CCReadState.file_size))
+                    marker = StringConcat(marker, " bytes]")
                     final = StringConcat(content, marker)
                     CCRead_SendResult(client_fd, id, final, 1)
                 } ElseBlock: {

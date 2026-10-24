@@ -147,6 +147,46 @@ Function.LSP_LoadFile {
 }
 
 // =============================================================================
+// OUTPUT TYPE NAMES
+// Output: stores a type code (AST.TYPE_INTEGER = 950) or a TYPE_CUSTOM
+// node in data1, not a string. EscapeString / StringCompare on that
+// code SIGSEGV and the daemon dies mid-request.
+// =============================================================================
+Function.LSP_TypeName {
+    Input: type_value: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(type_value, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(type_value, AST.TYPE_INTEGER) ThenBlock: { ReturnValue("Integer") }
+        IfCondition EqualTo(type_value, AST.TYPE_ADDRESS) ThenBlock: { ReturnValue("Address") }
+        IfCondition EqualTo(type_value, AST.TYPE_TEXT) ThenBlock: { ReturnValue("Text") }
+        IfCondition EqualTo(type_value, AST.TYPE_BOOLEAN) ThenBlock: { ReturnValue("Boolean") }
+        IfCondition EqualTo(type_value, AST.TYPE_VOID) ThenBlock: { ReturnValue("Void") }
+        IfCondition EqualTo(type_value, AST.TYPE_ANY) ThenBlock: { ReturnValue("Any") }
+        IfCondition EqualTo(type_value, AST.TYPE_BYTE) ThenBlock: { ReturnValue("Byte") }
+        IfCondition EqualTo(type_value, AST.TYPE_FLOAT) ThenBlock: { ReturnValue("Float") }
+        IfCondition EqualTo(type_value, AST.TYPE_DOUBLE) ThenBlock: { ReturnValue("Double") }
+        IfCondition GreaterThan(type_value, 4000000) ThenBlock: {
+            custom_type = AST_GetType(type_value)
+            IfCondition EqualTo(custom_type, AST.TYPE_CUSTOM) ThenBlock: {
+                custom_name = AST_GetData1(type_value)
+                ReturnValue(custom_name)
+            }
+        }
+        ReturnValue("Any")
+    }
+}
+
+Function.LSP_IsText {
+    Input: value: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(value, 4000000) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
 // AST WALKER FOR SYMBOLS + CALLS
 // =============================================================================
 Function.LSP_WalkAST {
@@ -200,7 +240,8 @@ Function.LSP_WalkAST {
         IfCondition EqualTo(type, AST.OUTPUT_DECL) ThenBlock: {
             is_symbol = 1
             kind = "Output"
-            name = AST_GetData1(node)
+            output_type = AST_GetData1(node)
+            name = LSP_TypeName(output_type)
         }
         
         // --- All Pool Types ---
@@ -464,7 +505,8 @@ Function.LSP_FindLineForMessage {
                             sym_tagged = Array.Get(sym_array, j)
                             sym_obj = JSON.AsObject(sym_tagged)
                             sym_name = JSON.GetString(sym_obj, "name")
-                            IfCondition NotEqual(sym_name, 0) ThenBlock: {
+                            name_ok = LSP_IsText(sym_name)
+                            IfCondition EqualTo(name_ok, 1) ThenBlock: {
                                 IfCondition EqualTo(StringCompare(sym_name, candidate), 0) ThenBlock: {
                                     sym_line = JSON.GetNumber(sym_obj, "line")
                                     IfCondition GreaterThan(sym_line, 0) ThenBlock: {
@@ -1515,6 +1557,16 @@ Function.LSP_BuildSchema {
     }
 }
 
+// Wire buffer only. The response object aliases literals and AST strings.
+Function.LSP_FreeStr {
+    Input: str: Address
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(str)
+        Deallocate(str, Add(n, 1))
+    }
+}
+
 Function.LSP_SendError {
     Input: client_fd: Integer
     Input: id: Address
@@ -1525,7 +1577,9 @@ Function.LSP_SendError {
         IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
         JSON.SetBool(resp, "ok", 0)
         JSON.SetString(resp, "error", msg)
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        LSP_FreeStr(wire)
     }
 }
 
@@ -1544,9 +1598,10 @@ Function.LSP_SendResult {
         
         IfCondition EqualTo(ok_val, 0) ThenBlock: {
             err_msg = JSON.GetString(result_obj, "error")
-            IfCondition NotEqual(err_msg, 0) ThenBlock: {
-                JSON.SetString(resp, "error", err_msg)
+            IfCondition EqualTo(err_msg, 0) ThenBlock: {
+                err_msg = "analysis failed"
             }
+            JSON.SetString(resp, "error", err_msg)
         } ElseBlock: {
             file_val = JSON.GetString(result_obj, "file")
             IfCondition NotEqual(file_val, 0) ThenBlock: {
@@ -1574,7 +1629,9 @@ Function.LSP_SendResult {
             }
         }
         
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        LSP_FreeStr(wire)
     }
 }
 
@@ -1587,7 +1644,9 @@ Function.LSP_SendSchema {
         resp = JSON.NewObject()
         JSON.SetString(resp, "method", "schema_response")
         IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
-        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+        wire = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, wire)
+        LSP_FreeStr(wire)
     }
 }
 
@@ -1680,6 +1739,7 @@ SubRoutine.Main {
                 IfCondition NotEqual(req, 0) ThenBlock: {
                     IfCondition NotEqual(req, -1) ThenBlock: {
                         LSP_HandleRequest(client_fd, req)
+                        LSP_FreeStr(req)
                     }
                 }
             }

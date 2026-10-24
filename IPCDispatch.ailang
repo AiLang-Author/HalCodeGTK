@@ -47,6 +47,9 @@ FixedPool.IPCDState {
     "proxy_conn_fd":    Initialize=-1, CanChange=True  // agent's connection to parent proxy
     "respawn_pids":     Initialize=0,  CanChange=True  // tracked PIDs of respawned workers (8-byte slots)
     "respawn_count":    Initialize=0,  CanChange=True
+    "host_ctl":         Initialize=-1, CanChange=True  // 127.0.0.1 shutdown listener
+    "host_sig":         Initialize=-1, CanChange=True  // signalfd for SIGTERM/SIGINT
+    "host_stop":        Initialize=0,  CanChange=True
 }
 
 // =============================================================================
@@ -81,7 +84,7 @@ Function.IPCDispatch.Shutdown {
             WhileLoop LessThan(r_i, IPCDState.respawn_count) {
                 r_pid = Dereference(Add(IPCDState.respawn_pids, Multiply(r_i, 8)))
                 IfCondition GreaterThan(r_pid, 0) ThenBlock: {
-                    SystemCall(62, r_pid, 15, 0, 0, 0)
+                    IPCDispatch_SignalPid(r_pid, 15)
                 }
                 r_i = Add(r_i, 1)
             }
@@ -97,7 +100,7 @@ Function.IPCDispatch.Shutdown {
                     StoreValue(r_ws, 0)
                     r_wr = SystemCall(61, r_pid, r_ws, 1, 0, 0)
                     IfCondition EqualTo(r_wr, 0) ThenBlock: {
-                        SystemCall(62, r_pid, 9, 0, 0, 0)
+                        IPCDispatch_SignalPid(r_pid, 9)
                         StoreValue(r_ws, 0)
                         SystemCall(61, r_pid, r_ws, 0, 0, 0)
                     }
@@ -198,16 +201,28 @@ Function.IPCDispatch.PollProxy {
             revents = GetByte(pfd, Add(Multiply(Add(_si, 1), 8), 6))
             IfCondition GreaterThan(BitwiseAnd(revents, 1), 0) ThenBlock: {
                 cfd2 = Dereference(Add(IPCDState.proxy_clients, Multiply(_si, 8)))
-                Socket.SetRecvTimeout(cfd2, 2000)
-                req_str = Socket.RecvMsg(cfd2)
+                // 0 = peer gone, -2 = live socket but the frame was not ready.
+                // A recv timeout must not close the chat agent: every tool
+                // call from that process shares this one fd.
+                req_str = IPCDispatch_ProxyRead(cfd2)
+                IfCondition EqualTo(req_str, -2) ThenBlock: {
+                    IPCD_Log("[proxy] read timeout, client kept\n")
+                } ElseBlock: {
                 IfCondition EqualTo(req_str, 0) ThenBlock: {
-                    // Client disconnected — compact slot
+                    // Real disconnect. Copy the last live slot down, clear
+                    // the vacated slot, and stop. Walking the stale poll
+                    // snapshot after a compact reads the swapped fd twice
+                    // and closes the surviving agent.
                     Socket.Close(cfd2)
                     last = Subtract(IPCDState.proxy_client_cnt, 1)
-                    last_fd = Dereference(Add(IPCDState.proxy_clients, Multiply(last, 8)))
-                    StoreValue(Add(IPCDState.proxy_clients, Multiply(_si, 8)), last_fd)
+                    IfCondition GreaterThan(last, _si) ThenBlock: {
+                        last_fd = Dereference(Add(IPCDState.proxy_clients, Multiply(last, 8)))
+                        StoreValue(Add(IPCDState.proxy_clients, Multiply(_si, 8)), last_fd)
+                    }
+                    StoreValue(Add(IPCDState.proxy_clients, Multiply(last, 8)), -1)
                     IPCDState.proxy_client_cnt = last
                     IPCD_Log("[proxy] agent disconnected\n")
+                    BreakLoop
                 } ElseBlock: {
                     // Parse and handle request
                     _rp = ParseJSON(req_str)
@@ -246,6 +261,7 @@ Function.IPCDispatch.PollProxy {
                             }
                         }
                     }
+                }
                 }
             }
             _si = Add(_si, 1)
@@ -485,6 +501,36 @@ Function.IPCDispatch.RegisterTool {
 // =============================================================================
 // SCHEMA ARRAY — feed straight into Anthropic.BuildRequest tools_arr arg
 // =============================================================================
+// The gauges live in the agent, not in a worker. Status is answered
+// inline. The schema still has to be on the tool list or the model cannot call it.
+Function.IPCDispatch_EnsureStatusSchema {
+    Body: {
+        IfCondition EqualTo(IPCDState.schemas_arr, 0) ThenBlock: { ReturnValue(0) }
+        n = JSON.ArrayLength(IPCDState.schemas_arr)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            tagged = JSON.ArrayGet(IPCDState.schemas_arr, i)
+            obj = JSON.AsObject(tagged)
+            name = JSON.GetString(obj, "name")
+            IfCondition And(NotEqual(name, 0), EqualTo(StringCompare(name, "Status"), 0)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        sch = JSON.NewObject()
+        JSON.SetString(sch, "name", "Status")
+        JSON.SetString(sch, "description", "Read this turn's gauges: tokens_in, tokens_out, window, pct, tool_chains, project, thread, session, session_log_bytes. No arguments.")
+        props = JSON.NewObject()
+        input = JSON.NewObject()
+        JSON.SetString(input, "type", "object")
+        JSON.SetObject(input, "properties", props)
+        req = JSON.NewArray()
+        JSON.SetArray(input, "required", req)
+        JSON.SetObject(sch, "input_schema", input)
+        JSON.PushObject(IPCDState.schemas_arr, sch)
+    }
+}
+
 Function.IPCDispatch.GetToolSchemasArray {
     Output: Address
     Body: {
@@ -493,6 +539,7 @@ Function.IPCDispatch.GetToolSchemasArray {
         IfCondition NotEqual(IPCDState.schemas_arr, 0) ThenBlock: {
             cached_n = JSON.ArrayLength(IPCDState.schemas_arr)
             IfCondition GreaterThan(cached_n, 0) ThenBlock: {
+                IPCDispatch_EnsureStatusSchema()
                 ReturnValue(IPCDState.schemas_arr)
             }
         }
@@ -509,6 +556,7 @@ Function.IPCDispatch.GetToolSchemasArray {
             i = Add(i, 1)
         }
         IPCDState.schemas_arr = new_arr
+        IPCDispatch_EnsureStatusSchema()
         ReturnValue(new_arr)
     }
 }
@@ -588,6 +636,169 @@ Function.IPCDispatch_BuildEnvp {
     }
 }
 
+// Signal the worker and every process in its group (shells it forked).
+Function.IPCDispatch_SignalPid {
+    Input: pid: Integer
+    Input: sig: Integer
+    Body: {
+        IfCondition LessEqual(pid, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(62, pid, sig, 0, 0, 0)
+        SystemCall(62, Subtract(0, pid), sig, 0, 0, 0)
+    }
+}
+
+// Reuse a zero slot. Appending forever dropped live pids after 64 respawns
+// while the dead ones were still occupying the table.
+Function.IPCDispatch_RememberPid {
+    Input: pid: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(pid, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(IPCDState.respawn_pids, 0) ThenBlock: {
+            IPCDState.respawn_pids = Allocate(512)
+            MemorySet(IPCDState.respawn_pids, 0, 512)
+            IPCDState.respawn_count = 0
+        }
+        i = 0
+        WhileLoop LessThan(i, IPCDState.respawn_count) {
+            slot = Multiply(i, 8)
+            IfCondition EqualTo(Dereference(Add(IPCDState.respawn_pids, slot)), 0) ThenBlock: {
+                StoreValue(Add(IPCDState.respawn_pids, slot), pid)
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(IPCDState.respawn_count, 64) ThenBlock: {
+            StoreValue(Add(IPCDState.respawn_pids, Multiply(IPCDState.respawn_count, 8)), pid)
+            IPCDState.respawn_count = Add(IPCDState.respawn_count, 1)
+            ReturnValue(1)
+        }
+        IPCD_Log("[ipcd] respawn PID TABLE FULL\n")
+        ReturnValue(0)
+    }
+}
+
+// Clear slots for workers that have exited. wr==-10 is ECHILD: something
+// else already waitpid'd them (IPCDispatch_ReapZombies uses waitpid -1).
+Function.IPCDispatch_ReapRespawns {
+    Body: {
+        IfCondition EqualTo(IPCDState.respawn_pids, 0) ThenBlock: { ReturnValue(0) }
+        ws = Allocate(8)
+        i = 0
+        WhileLoop LessThan(i, IPCDState.respawn_count) {
+            slot = Multiply(i, 8)
+            pid = Dereference(Add(IPCDState.respawn_pids, slot))
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                StoreValue(ws, 0)
+                wr = SystemCall(61, pid, ws, 1, 0, 0)
+                IfCondition GreaterThan(wr, 0) ThenBlock: {
+                    StoreValue(Add(IPCDState.respawn_pids, slot), 0)
+                }
+                IfCondition EqualTo(wr, -10) ThenBlock: {
+                    StoreValue(Add(IPCDState.respawn_pids, slot), 0)
+                }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(ws, 8)
+    }
+}
+
+Function.IPCDispatch_IsShutdown {
+    Input: buf: Address
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(n, 8) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 0), 115) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 1), 104) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 2), 117) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 3), 116) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 4), 100) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 5), 111) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 6), 119) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(buf, 7), 110) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+// Called from the host idle loop and from a tool wait. timeout_ms is how
+// long to block when nothing is pending. A connection that sends "shutdown"
+// or a pending SIGTERM/SIGINT sets host_stop.
+Function.IPCDispatch_HostCheck {
+    Input: timeout_ms: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(IPCDState.host_stop, 1) ThenBlock: { ReturnValue(1) }
+        ctl = IPCDState.host_ctl
+        sigfd = IPCDState.host_sig
+        IfCondition And(LessThan(ctl, 0), LessThan(sigfd, 0)) ThenBlock: {
+            IfCondition GreaterThan(timeout_ms, 0) ThenBlock: {
+                ts = Allocate(16)
+                StoreValue(ts, 0)
+                StoreValue(Add(ts, 8), Multiply(timeout_ms, 1000000))
+                SystemCall(35, ts, 0, 0, 0, 0)
+                Deallocate(ts, 16)
+            }
+            ReturnValue(0)
+        }
+        pfd = Allocate(16)
+        MemorySet(pfd, 0, 16)
+        nfd = 0
+        ctl_i = -1
+        sig_i = -1
+        IfCondition GreaterEqual(ctl, 0) ThenBlock: {
+            StoreValue(Add(pfd, Multiply(nfd, 8)), ctl, "dword")
+            StoreValue(Add(Add(pfd, Multiply(nfd, 8)), 4), 1, "dword")
+            ctl_i = nfd
+            nfd = Add(nfd, 1)
+        }
+        IfCondition GreaterEqual(sigfd, 0) ThenBlock: {
+            StoreValue(Add(pfd, Multiply(nfd, 8)), sigfd, "dword")
+            StoreValue(Add(Add(pfd, Multiply(nfd, 8)), 4), 1, "dword")
+            sig_i = nfd
+            nfd = Add(nfd, 1)
+        }
+        SystemCall(7, pfd, nfd, timeout_ms, 0, 0)
+        stop = 0
+        IfCondition GreaterEqual(sig_i, 0) ThenBlock: {
+            rev = RightShift(Dereference(Add(Add(pfd, Multiply(sig_i, 8)), 4), "dword"), 16)
+            IfCondition NotEqual(BitwiseAnd(rev, 57), 0) ThenBlock: {
+                junk = Allocate(128)
+                SystemCall(0, sigfd, junk, 128, 0, 0)
+                Deallocate(junk, 128)
+                stop = 1
+            }
+        }
+        IfCondition GreaterEqual(ctl_i, 0) ThenBlock: {
+            rev2 = RightShift(Dereference(Add(Add(pfd, Multiply(ctl_i, 8)), 4), "dword"), 16)
+            IfCondition NotEqual(BitwiseAnd(rev2, 1), 0) ThenBlock: {
+                cfd = Socket.Accept4(ctl)
+                IfCondition GreaterEqual(cfd, 0) ThenBlock: {
+                    cp = Allocate(8)
+                    StoreValue(cp, cfd, "dword")
+                    StoreValue(Add(cp, 4), 1, "dword")
+                    SystemCall(7, cp, 1, 200, 0, 0)
+                    Deallocate(cp, 8)
+                    buf = Allocate(32)
+                    MemorySet(buf, 0, 32)
+                    n = Socket.RecvNB(cfd, buf, 31)
+                    IfCondition EqualTo(IPCDispatch_IsShutdown(buf, n), 1) ThenBlock: {
+                        okm = "ok\n"
+                        Socket.Send(cfd, okm, 3)
+                        stop = 1
+                    }
+                    Deallocate(buf, 32)
+                    Socket.Close(cfd)
+                }
+            }
+        }
+        Deallocate(pfd, 16)
+        IfCondition EqualTo(stop, 1) ThenBlock: { IPCDState.host_stop = 1 }
+        ReturnValue(stop)
+    }
+}
+
 // Fork+exec a dead worker. The first boot (CC_LaunchTool) passes the full
 // inherited environment; an empty envp makes cc_*_ipc.x crash on startup.
 Function.IPCDispatch_Respawn {
@@ -605,6 +816,7 @@ Function.IPCDispatch_Respawn {
         }
         pid = SystemCall(57, 0, 0, 0, 0, 0)
         IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(109, 0, 0, 0, 0, 0)
             SystemCall(157, 1, 15, 0, 0, 0)
             // Silence stdout/stderr so the worker never clobbers the TUI.
             devnull = SystemCall(2, "/dev/null", 1, 0, 0, 0)
@@ -625,20 +837,88 @@ Function.IPCDispatch_Respawn {
             IPCD_Log("[ipcd] respawn fork failed\n")
             ReturnValue(0)
         }
+        // Own process group so shutdown can signal shells this worker forks.
+        SystemCall(109, pid, pid, 0, 0, 0)
         // Track the PID so IPCDispatch.Shutdown can SIGTERM/reap it — the
         // respawn path previously leaked workers on exit (WSL2 PDEATHSIG gap).
-        IfCondition EqualTo(IPCDState.respawn_pids, 0) ThenBlock: {
-            IPCDState.respawn_pids = Allocate(Multiply(64, 8))
-            MemorySet(IPCDState.respawn_pids, 0, Multiply(64, 8))
-        }
-        IfCondition LessThan(IPCDState.respawn_count, 64) ThenBlock: {
-            r_slot = Multiply(IPCDState.respawn_count, 8)
-            StoreValue(Add(IPCDState.respawn_pids, r_slot), pid)
-            IPCDState.respawn_count = Add(IPCDState.respawn_count, 1)
-        }
+        IPCDispatch_RememberPid(pid)
         IPCD_Log("[ipcd] respawned ")
         IPCD_Log(name)
         IPCD_Log("\n")
+        ReturnValue(1)
+    }
+}
+
+// Read one proxy frame.
+// Returns the message, 0 if the peer is gone, or -2 if the socket is
+// still up but the frame did not arrive (recv timeout). Callers must
+// not close the client on -2.
+Function.IPCDispatch_ProxyRead {
+    Input: cfd: Integer
+    Output: Address
+    Body: {
+        Socket.SetRecvTimeout(cfd, 2000)
+        msg = Socket.RecvMsg(cfd)
+        IfCondition NotEqual(msg, 0) ThenBlock: { ReturnValue(msg) }
+        hp = Allocate(8)
+        StoreValue(hp, cfd, "dword")
+        StoreValue(Add(hp, 4), 1, "dword")
+        SystemCall(7, hp, 1, 0, 0, 0)
+        hrev = GetByte(hp, 6)
+        Deallocate(hp, 8)
+        // POLLERR=8 POLLHUP=16 POLLNVAL=32
+        IfCondition GreaterThan(BitwiseAnd(hrev, 56), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(BitwiseAnd(hrev, 1), 0) ThenBlock: {
+            msg2 = Socket.RecvMsg(cfd)
+            ReturnValue(msg2)
+        }
+        ReturnValue(-2)
+    }
+}
+
+// Proxy mode stores one shared fd in every tool slot and leaves
+// sock_path at 0. IPCDispatch_Reconnect would close that fd and then
+// fail to dial a tool socket, which bricks every later call.
+// Re-dial AgentProxy and point the whole table at the new fd.
+Function.IPCDispatch_ReconnectProxy {
+    Output: Integer
+    Body: {
+        old = IPCDState.proxy_conn_fd
+        IfCondition GreaterEqual(old, 0) ThenBlock: { Socket.Close(old) }
+        IPCDState.proxy_conn_fd = -1
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        att = 0
+        cr = -1
+        // Host boot to AgentProxy is about 1–2s. 8×100ms lost the race
+        // after a crash restart and left every tool fd on the closed socket.
+        WhileLoop And(LessThan(att, 40), LessThan(cr, 0)) {
+            cr = Socket.ConnectUnix(fd, "@halcode/AgentProxy")
+            IfCondition LessThan(cr, 0) ThenBlock: {
+                Socket.Close(fd)
+                fd = Socket.Create(1, 1)
+                IfCondition LessThan(fd, 0) ThenBlock: {
+                    IPCD_Log("[proxy-agent] reconnect failed\n")
+                    ReturnValue(0)
+                }
+                IPCDispatch_SleepMs(100)
+                att = Add(att, 1)
+            }
+        }
+        IfCondition LessThan(cr, 0) ThenBlock: {
+            Socket.Close(fd)
+            IPCD_Log("[proxy-agent] reconnect failed\n")
+            ReturnValue(0)
+        }
+        IPCDState.proxy_conn_fd = fd
+        IPCDState.proxy_mode = 1
+        i = 0
+        WhileLoop LessThan(i, IPCDState.count) {
+            base = Add(IPCDState.table, Multiply(i, IPCDConst.ENTRY_SIZE))
+            StoreValue(Add(base, IPCDOff.FD), fd)
+            i = Add(i, 1)
+        }
+        IPCD_Log("[proxy-agent] reconnected\n")
         ReturnValue(1)
     }
 }
@@ -733,7 +1013,11 @@ Function.IPCDispatch.Dispatch {
 
         fd = IPCDispatch_FindFd(name)
         IfCondition LessThan(fd, 0) ThenBlock: {
-            IPCDispatch_Reconnect(name)
+            IfCondition EqualTo(IPCDState.proxy_mode, 1) ThenBlock: {
+                IPCDispatch_ReconnectProxy()
+            } ElseBlock: {
+                IPCDispatch_Reconnect(name)
+            }
             fd = IPCDispatch_FindFd(name)
         }
         IfCondition LessThan(fd, 0) ThenBlock: {
@@ -766,12 +1050,15 @@ Function.IPCDispatch.Dispatch {
 
         sr = Socket.SendMsg(fd, req_str)
         IfCondition LessThan(sr, 0) ThenBlock: {
-            IfCondition EqualTo(IPCDState.proxy_mode, 0) ThenBlock: {
+            IfCondition EqualTo(IPCDState.proxy_mode, 1) ThenBlock: {
+                IPCDispatch_ReconnectProxy()
+                fd = IPCDState.proxy_conn_fd
+            } ElseBlock: {
                 IPCDispatch_Reconnect(name)
                 fd = IPCDispatch_FindFd(name)
-                IfCondition GreaterEqual(fd, 0) ThenBlock: {
-                    sr = Socket.SendMsg(fd, req_str)
-                }
+            }
+            IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                sr = Socket.SendMsg(fd, req_str)
             }
             IfCondition LessThan(sr, 0) ThenBlock: {
                 StoreValue(out_is_error_ptr, 1, "dword")
@@ -802,16 +1089,27 @@ Function.IPCDispatch.Dispatch {
         StoreValue(Add(pfd, 4), 1, "dword") // POLLIN
         WhileLoop 1 {
             pr = SystemCall(7, pfd, 1, 15, 0, 0) // SYS_POLL = 7, 15ms timeout
-            IfCondition NotEqual(pr, 0) ThenBlock: { BreakLoop }
+            // pr < 0 is EINTR. Breaking here made a 90s Sleep look like a
+            // dead tool after one second, and proxy mode then dropped the
+            // only socket every tool call uses.
+            IfCondition GreaterThan(pr, 0) ThenBlock: { BreakLoop }
             UI.AnimTick()
             // While waiting for a tool result, service any pending agent requests
             IfCondition EqualTo(IPCDState.proxy_mode, 0) ThenBlock: {
                 IPCDispatch.PollProxy()
+                IPCDispatch_ReapRespawns()
+                IfCondition EqualTo(IPCDispatch_HostCheck(0), 1) ThenBlock: { BreakLoop }
             }
             t_now = SystemCall(201, 0, 0, 0, 0, 0)
             IfCondition GreaterEqual(Subtract(t_now, t_start), tool_timeout) ThenBlock: { BreakLoop }
         }
         Deallocate(pfd, 8)
+
+        IfCondition EqualTo(IPCDState.host_stop, 1) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            IPCD_Log("[ipcd] dispatch aborted, host stopping\n")
+            ReturnValue("host shutting down")
+        }
 
         Socket.SetRecvTimeout(fd, 1000)
         IPCD_Log("[ipcd] dispatch recv ")
@@ -826,7 +1124,11 @@ Function.IPCDispatch.Dispatch {
             IPCD_Log("[ipcd] dispatch disconnected ")
             IPCD_Log(name)
             IPCD_Log("\n")
-            IPCDispatch_Reconnect(name)
+            IfCondition EqualTo(IPCDState.proxy_mode, 1) ThenBlock: {
+                IPCDispatch_ReconnectProxy()
+            } ElseBlock: {
+                IPCDispatch_Reconnect(name)
+            }
             IfCondition GreaterEqual(elapsed, tool_timeout) ThenBlock: {
                 ReturnValue(StringConcat("tool TIMED OUT: ", name))
             }
@@ -844,11 +1146,15 @@ Function.IPCDispatch.Dispatch {
             ReturnValue(StringConcat("tool response too large (>64KB): ", name))
         }
         // Slow-tool flag: only emit if we crossed 5s, so fast tools stay quiet.
+        // ChatPrintln no-ops until UI.Init. --host never inits the TUI, and
+        // the old call wrote through a null buffer and killed the process.
         IfCondition GreaterEqual(elapsed, 5) ThenBlock: {
             slow_msg = StringConcat("[slow tool: ", name)
             slow_msg = StringConcat(slow_msg, " took ")
             slow_msg = StringConcat(slow_msg, NumberToString(elapsed))
             slow_msg = StringConcat(slow_msg, "s]")
+            IPCD_Log(slow_msg)
+            IPCD_Log("\n")
             UI.ChatPrintln(slow_msg)
         }
 
@@ -891,6 +1197,15 @@ Function.IPCDispatch.Dispatch {
         StoreValue(out_is_error_ptr, 1, "dword")
         err = JSON.GetString(obj, "error")
         IfCondition EqualTo(err, 0) ThenBlock: {
+            // Tools that set ok=0 and put the text only in content used to
+            // surface as "no detail".
+            err = JSON.GetString(obj, "content")
+            IfCondition NotEqual(err, 0) ThenBlock: {
+                IfCondition GreaterThan(StringLength(err), 0) ThenBlock: {
+                    IPCD_Log("[ipcd] dispatch err from content\n")
+                    ReturnValue(err)
+                }
+            }
             IPCD_Log("[ipcd] dispatch err no detail\n")
             ReturnValue(StringConcat("tool returned error (no detail)", ""))
         }

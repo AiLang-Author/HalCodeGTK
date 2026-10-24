@@ -4,14 +4,14 @@
 // returns exit code + output. The model's universal escape hatch — when
 // nothing else fits, Bash does.
 //
-// Schema: command (required string), timeout_secs (int, default 0 = no timeout).
+// Schema: command (required string), timeout_secs (int, 0 = 30s default, max 55).
 // Output format:
 //   exit=<N>
 //   <combined output>
 //
 // stderr is merged via the shell's `2>&1` so we only need one pipe.
-// For Phase 1, timeout_secs is accepted but not enforced (always blocking
-// wait). Add SIGALRM-based timeout in Phase 2.
+// timeout_secs is a wall-clock deadline. 0 uses DEFAULT_TIMEOUT (30s).
+// On expiry the shell's process group is SIGKILL'd and the exit code is 137.
 //
 // Build: ./ailang.x Applications/ClaudeCode/cc_tools/cc_bash_ipc.ailang cc_bash_ipc.x
 // Run:   ./cc_bash_ipc.x   (binds /tmp/ailang_cctools/Bash.sock)
@@ -29,6 +29,7 @@ FixedPool.CCBashSys {
     "SYS_WRITE":     Initialize=1
     "SYS_OPEN":      Initialize=2
     "SYS_CLOSE":     Initialize=3
+    "SYS_LSEEK":     Initialize=8
     "SYS_POLL":      Initialize=7
     "SYS_PIPE":      Initialize=22
     "SYS_DUP2":      Initialize=33
@@ -37,11 +38,15 @@ FixedPool.CCBashSys {
     "SYS_EXIT":      Initialize=60
     "SYS_WAIT4":     Initialize=61
     "SYS_KILL":      Initialize=62
+    "SYS_SETPGID":   Initialize=109
     "SYS_MKDIR":     Initialize=83
     "SYS_UNLINK":    Initialize=87
     "SYS_TIME":      Initialize=201
     "POLLIN":        Initialize=1
     "O_RDONLY":      Initialize=0
+    "O_RDWR":        Initialize=2
+    "O_CREAT":       Initialize=64
+    "O_TRUNC":       Initialize=512
     "SIGKILL":       Initialize=9
     "WNOHANG":       Initialize=1
     "DEFAULT_TIMEOUT": Initialize=30
@@ -64,9 +69,9 @@ FixedPool.CCBashState {
 Function.CCBash_BuildSchema {
     Output: Address
     Body: {
-        s = UtilArgs_NewSchema("Bash", "Run a shell command via /bin/sh and return its combined stdout+stderr with exit code")
+        s = UtilArgs_NewSchema("Bash", "Run a shell command via /bin/sh. stdout comes first. stderr, when any, follows a [stderr] line. Redirects are not on the Undo stack.")
         UtilArgs_AddField(s, "command", "string", 1, "Shell command to execute (interpreted by /bin/sh -c)", "command")
-        UtilArgs_AddField(s, "timeout_secs", "int", 0, "Wall-clock timeout in seconds (0 = no timeout)", "timeout_secs")
+        UtilArgs_AddField(s, "timeout_secs", "int", 0, "Wall-clock timeout in seconds (0 = 30s default, max 55)", "timeout_secs")
         UtilArgs_SetDefault(s, "timeout_secs", "0")
         ReturnValue(s)
     }
@@ -171,10 +176,21 @@ Function.CCBash_Run {
         pipe_w = Dereference(Add(pf, 4), "dword")
         Deallocate(pf, 8)
 
+        // stderr goes to its own file so a warning is not mixed into stdout.
+        err_flags = BitwiseOr(CCBashSys.O_RDWR, BitwiseOr(CCBashSys.O_CREAT, CCBashSys.O_TRUNC))
+        err_fd = SystemCall(CCBashSys.SYS_OPEN, "/tmp/halcode_app/bash.err", err_flags, 420, 0, 0)
+
+        // Heap slot so a later syscall cannot clobber the child pid.
+        pid_box = Allocate(8)
+        StoreValue(pid_box, 0)
         pid = SystemCall(CCBashSys.SYS_FORK, 0, 0, 0, 0, 0)
         IfCondition LessThan(pid, 0) ThenBlock: {
+            Deallocate(pid_box, 8)
             SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
             SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+            IfCondition GreaterEqual(err_fd, 0) ThenBlock: {
+                SystemCall(CCBashSys.SYS_CLOSE, err_fd, 0, 0, 0, 0)
+            }
             Deallocate(argv, 32)
             IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
             IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
@@ -182,14 +198,23 @@ Function.CCBash_Run {
         }
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
-            // Child: redirect stdout+stderr to pipe, exec shell.
+            // Own group so the timeout kill reaches sleep and anything else
+            // the shell forks. Never the tool's group, never the host's.
+            SystemCall(CCBashSys.SYS_SETPGID, 0, 0, 0, 0, 0)
             SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
             SystemCall(CCBashSys.SYS_DUP2,  pipe_w, 1, 0, 0, 0)
-            SystemCall(CCBashSys.SYS_DUP2,  pipe_w, 2, 0, 0, 0)
+            IfCondition GreaterEqual(err_fd, 0) ThenBlock: {
+                SystemCall(CCBashSys.SYS_DUP2, err_fd, 2, 0, 0, 0)
+                SystemCall(CCBashSys.SYS_CLOSE, err_fd, 0, 0, 0, 0)
+            } ElseBlock: {
+                SystemCall(CCBashSys.SYS_DUP2, pipe_w, 2, 0, 0, 0)
+            }
             SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
             SystemCall(CCBashSys.SYS_EXECVE, "/bin/sh", argv, envp)
             SystemCall(CCBashSys.SYS_EXIT, 127, 0, 0, 0, 0)
         }
+        StoreValue(pid_box, pid)
+        SystemCall(CCBashSys.SYS_SETPGID, pid, pid, 0, 0, 0)
 
         // Parent: close write end.
         SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
@@ -271,9 +296,14 @@ Function.CCBash_Run {
         Deallocate(chunk, CCBashConst.READ_CHUNK)
         SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
 
-        // Kill child if we hit the deadline.
+        // Kill the shell group if we hit the deadline. pid <= 1 is never a
+        // child (0 is this process's group, 1 is init, negative is a group).
         IfCondition EqualTo(timed_out, 1) ThenBlock: {
-            SystemCall(CCBashSys.SYS_KILL, pid, CCBashSys.SIGKILL, 0, 0, 0)
+            live = Dereference(pid_box)
+            IfCondition GreaterThan(live, 1) ThenBlock: {
+                SystemCall(CCBashSys.SYS_KILL, live, CCBashSys.SIGKILL, 0, 0, 0)
+                SystemCall(CCBashSys.SYS_KILL, Subtract(0, live), CCBashSys.SIGKILL, 0, 0, 0)
+            }
             timeout_note = "\n[timed out]"
             tn_len = StringLength(timeout_note)
             avail = Subtract(CCBashConst.MAX_OUTPUT, used)
@@ -293,9 +323,10 @@ Function.CCBash_Run {
         status_buf = Allocate(8)
         StoreValue(status_buf, 0)
         raw_status = 0
+        live_pid = Dereference(pid_box)
         wi = 0
         WhileLoop LessThan(wi, 10) {
-            wr = SystemCall(CCBashSys.SYS_WAIT4, pid, status_buf, CCBashSys.WNOHANG, 0, 0)
+            wr = SystemCall(CCBashSys.SYS_WAIT4, live_pid, status_buf, CCBashSys.WNOHANG, 0, 0)
             IfCondition NotEqual(wr, 0) ThenBlock: {
                 raw_status = Dereference(status_buf, "dword")
                 wi = 10
@@ -309,8 +340,17 @@ Function.CCBash_Run {
             }
         }
         Deallocate(status_buf, 8)
-        // POSIX: bits 8-15 = exit code when WIFEXITED, bits 0-7 = signal number.
+        Deallocate(pid_box, 8)
+        // POSIX: bits 8-15 = exit code when WIFEXITED. Low 7 bits = signal
+        // when WIFSIGNALED. Report 128+signal (SIGKILL → 137), not exit 0.
+        sig = BitwiseAnd(raw_status, 127)
         exit_code = BitwiseAnd(RightShift(raw_status, 8), 255)
+        IfCondition And(GreaterThan(sig, 0), NotEqual(sig, 127)) ThenBlock: {
+            exit_code = Add(128, sig)
+        }
+        IfCondition And(EqualTo(timed_out, 1), EqualTo(exit_code, 0)) ThenBlock: {
+            exit_code = 137
+        }
 
         // Build "exit=N\n" prefix in-place
         prefix_buf = Allocate(32)
@@ -332,8 +372,23 @@ Function.CCBash_Run {
         SetByte(prefix_buf, Add(plen, dlen), 10)  // newline
         prefix_total = Add(plen, Add(dlen, 1))
 
-        // Final layout: prefix + body
-        final_len = Add(prefix_total, used)
+        // Append a tagged stderr section when the command wrote any.
+        err_used = 0
+        err_buf = 0
+        IfCondition GreaterEqual(err_fd, 0) ThenBlock: {
+            SystemCall(CCBashSys.SYS_LSEEK, err_fd, 0, 0, 0, 0)
+            err_buf = Allocate(8001)
+            err_used = SystemCall(CCBashSys.SYS_READ, err_fd, err_buf, 8000, 0, 0)
+            IfCondition LessThan(err_used, 0) ThenBlock: { err_used = 0 }
+            SetByte(err_buf, err_used, 0)
+            SystemCall(CCBashSys.SYS_CLOSE, err_fd, 0, 0, 0, 0)
+        }
+        err_tag = "\n[stderr]\n"
+        err_tag_len = 0
+        IfCondition GreaterThan(err_used, 0) ThenBlock: { err_tag_len = StringLength(err_tag) }
+
+        // Final layout: prefix + stdout body + optional [stderr] section
+        final_len = Add(prefix_total, Add(used, Add(err_tag_len, err_used)))
         final = Allocate(Add(final_len, 1))
         k = 0
         WhileLoop LessThan(k, prefix_total) {
@@ -344,6 +399,19 @@ Function.CCBash_Run {
         WhileLoop LessThan(m, used) {
             SetByte(final, Add(prefix_total, m), GetByte(out, Add(body_off, m)))
             m = Add(m, 1)
+        }
+        IfCondition GreaterThan(err_used, 0) ThenBlock: {
+            et = 0
+            WhileLoop LessThan(et, err_tag_len) {
+                SetByte(final, Add(Add(prefix_total, used), et), GetByte(err_tag, et))
+                et = Add(et, 1)
+            }
+            eb = 0
+            WhileLoop LessThan(eb, err_used) {
+                SetByte(final, Add(Add(Add(prefix_total, used), err_tag_len), eb), GetByte(err_buf, eb))
+                eb = Add(eb, 1)
+            }
+            Deallocate(err_buf, 8001)
         }
         SetByte(final, final_len, 0)
         Deallocate(prefix_buf, 32)
@@ -655,8 +723,70 @@ Function.CCBash_ContainsPipeToShell {
     }
 }
 
+// Returns 1 if cmd[j..] starts with lit.
+Function.CCBash_StartsAt {
+    Input: cmd: Address
+    Input: len: Integer
+    Input: j: Integer
+    Input: lit: Address
+    Output: Integer
+    Body: {
+        n = StringLength(lit)
+        IfCondition GreaterThan(Add(j, n), len) ThenBlock: { ReturnValue(0) }
+        k = 0
+        WhileLoop LessThan(k, n) {
+            IfCondition NotEqual(GetByte(cmd, Add(j, k)), GetByte(lit, k)) ThenBlock: {
+                ReturnValue(0)
+            }
+            k = Add(k, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Returns 1 if cmd[j..] is exactly lit, or lit followed by a shell boundary.
+Function.CCBash_MatchBounded {
+    Input: cmd: Address
+    Input: len: Integer
+    Input: j: Integer
+    Input: lit: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CCBash_StartsAt(cmd, len, j, lit), 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(lit)
+        IfCondition EqualTo(Add(j, n), len) ThenBlock: { ReturnValue(1) }
+        b = GetByte(cmd, Add(j, n))
+        IfCondition EqualTo(b, 32)  ThenBlock: { ReturnValue(1) }  // space
+        IfCondition EqualTo(b, 9)   ThenBlock: { ReturnValue(1) }  // tab
+        IfCondition EqualTo(b, 10)  ThenBlock: { ReturnValue(1) }  // newline
+        IfCondition EqualTo(b, 59)  ThenBlock: { ReturnValue(1) }  // ;
+        IfCondition EqualTo(b, 38)  ThenBlock: { ReturnValue(1) }  // &
+        IfCondition EqualTo(b, 124) ThenBlock: { ReturnValue(1) }  // |
+        IfCondition EqualTo(b, 62)  ThenBlock: { ReturnValue(1) }  // >
+        ReturnValue(0)
+    }
+}
+
+// /dev/null and the stdio aliases are not OS-critical writes.
+// /dev/sda, /dev/mem, and the rest of /dev stay blocked.
+Function.CCBash_IsAllowedDevSink {
+    Input: cmd: Address
+    Input: len: Integer
+    Input: j: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CCBash_MatchBounded(cmd, len, j, "/dev/null"), 1)   ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCBash_MatchBounded(cmd, len, j, "/dev/stdout"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCBash_MatchBounded(cmd, len, j, "/dev/stderr"), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCBash_MatchBounded(cmd, len, j, "/dev/tty"), 1)    ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(CCBash_StartsAt(cmd, len, j, "/dev/fd/"), 1)        ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
 // Returns 1 if cmd contains a shell output-redirect (> or >>) targeting a system path.
 // Catches patterns like: echo x > /etc/passwd, cmd > /bin/evil
+// Allows >/dev/null, 2>/dev/null, >/dev/stdout, >/dev/stderr, >/dev/tty, >/dev/fd/N.
 Function.CCBash_IsRedirectToSystemPath {
     Input: cmd: Address
     Output: Integer
@@ -685,7 +815,12 @@ Function.CCBash_IsRedirectToSystemPath {
                             c_after = GetByte(cmd, Add(j, 1))
                         }
                         IfCondition EqualTo(CCBash_IsRmSystemRoot(c_after), 1) ThenBlock: {
-                            ReturnValue(1)
+                            allowed = 0
+                            // byte 100 is 'd' — /dev may be a null sink
+                            IfCondition EqualTo(c_after, 100) ThenBlock: {
+                                allowed = CCBash_IsAllowedDevSink(cmd, len, j)
+                            }
+                            IfCondition EqualTo(allowed, 0) ThenBlock: { ReturnValue(1) }
                         }
                     }
                 }
@@ -889,8 +1024,11 @@ Function.CCBash_HandleRequest {
                 CCBash_SendError(client_fd, id, "Blocked: shell output redirect (> or >>) targeting a system path. Writing to OS-critical directories is not allowed.")
                 ReturnValue(0)
             }
+            // Schema type is int, so the model sends a JSON number.
+            // GetString on a number is 0, which used to fall through to the
+            // 30s default and ignore timeout_secs. A string still parses.
+            timeout_secs = UtilArgs_GetInt(validated, "timeout_secs")
             timeout_str  = UtilArgs_GetString(validated, "timeout_secs")
-            timeout_secs = 0
             IfCondition NotEqual(timeout_str, 0) ThenBlock: {
                 timeout_secs = StringToInt(timeout_str)
             }
@@ -927,8 +1065,10 @@ SubRoutine.Main {
 
     fd = Socket.Create(1, 1)
     IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
-    Socket.BindUnix(fd, CCBashConst.SOCK_PATH)
-    Socket.Listen(fd, CCBashConst.BACKLOG)
+    br = Socket.BindUnix(fd, CCBashConst.SOCK_PATH)
+    IfCondition LessThan(br, 0) ThenBlock: { Exit(1) }
+    lr = Socket.Listen(fd, CCBashConst.BACKLOG)
+    IfCondition LessThan(lr, 0) ThenBlock: { Exit(1) }
     CCBashState.listen_fd = fd
 
     PrintMessage("[cc_bash_ipc] listening on ")

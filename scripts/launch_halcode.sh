@@ -32,6 +32,32 @@ fi
 
 # Exact /proc comm only. Never -f (would catch HalCode9000.x --mcp).
 # Linux comm is 15 chars: halcode_shell_gtk → halcode_shell_g
+# Ask a live --host to kill its tools first. The bracketed pattern does not
+# match this script's own command line, and it does not match --mcp.
+host_shutdown() {
+    python3 - <<'PY' || true
+import socket
+try:
+    port = int(open("/tmp/halcode_app/host.port").read().strip() or "0")
+except Exception:
+    raise SystemExit(0)
+if port <= 0 or port > 65535:
+    raise SystemExit(0)
+s = socket.create_connection(("127.0.0.1", port), 2)
+s.settimeout(2)
+s.sendall(b"shutdown\n")
+try:
+    s.recv(16)
+except Exception:
+    pass
+s.close()
+PY
+    sleep 0.4
+    pgrep -f '[H]alCode9000\.x --host' | xargs -r kill 2>/dev/null || true
+    sleep 0.3
+    pgrep -f '[H]alCode9000\.x --host' | xargs -r kill -9 2>/dev/null || true
+}
+host_shutdown
 pkill -x halcode_desk.x 2>/dev/null || true
 pkill -x halcode_shell_g 2>/dev/null || true
 if [[ -f /tmp/halcode_gtk.pid ]]; then kill "$(cat /tmp/halcode_gtk.pid)" 2>/dev/null || true; fi
@@ -46,7 +72,11 @@ cd "$ROOT"
 "$DESK" >>"$LOG" 2>&1 &
 DESK_PID=$!
 echo "$DESK_PID" > /tmp/halcode_desk.pid
-cleanup() { kill "$DESK_PID" 2>/dev/null || true; wait "$DESK_PID" 2>/dev/null || true; }
+cleanup() {
+    host_shutdown
+    kill "$DESK_PID" 2>/dev/null || true
+    wait "$DESK_PID" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 sleep 0.4
 if ! kill -0 "$DESK_PID" 2>/dev/null; then
