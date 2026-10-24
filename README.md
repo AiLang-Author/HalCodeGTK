@@ -13,7 +13,6 @@ Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. MIT.
 - Linux desktop (X11)
 - `cc`, `pkg-config`, GTK 3 + cairo (`libgtk-3-dev libcairo2-dev`)
 - [`ailang.x`](https://github.com/AiLang-Author/Ailang-Self-Hosting-) on `PATH`
-- Optional: PostgreSQL (pgmem), [OlympusRepo](https://github.com/AiLang-Author/OlympusRepo) (relmem)
 
 Debian / Ubuntu:
 
@@ -34,7 +33,7 @@ chmod +x install.sh
 
 That builds the agent, GTK host, and desk; registers **HalCode9000** in the
 Applications menu; links `~/.local/bin/halcode` and `~/.local/bin/lastlog`;
-and runs `setup.sh` for API keys / pgmem.
+and runs `setup.sh` for API keys.
 
 ```bash
 ./install.sh --skip-keys --skip-postgres --skip-olympus

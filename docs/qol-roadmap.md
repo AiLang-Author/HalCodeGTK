@@ -27,10 +27,10 @@ view.
 
 ### 2. Auto-compaction (already planned as 17.5)
 Go past the current "context at N% — checkpoint parked" cliff. At ~70%,
-silently summarize the oldest turns, park the summary in Pgmem
-(`op=compact` exists), and continue without user intervention.
+silently summarize the oldest turns, park the summary in the memory
+plugin, and continue without user intervention.
 
-- Hooks: `Pgmem op=compact`, context-window accounting in the main loop.
+- Hooks: context-window accounting in the main loop.
 - Why: Claude Code truncates and loses the thread; seamless rollover is a
   real differentiator.
 
@@ -39,11 +39,11 @@ silently summarize the oldest turns, park the summary in Pgmem
 ## Tier 2 — differentiators
 
 ### 3. Cross-session search (`/search`)
-Session logs and decisions are already parked in Pgmem with full-text search.
-Expose it as a slash command to answer "what did we decide about X last week"
+Session logs and decisions are already parked for search.
+Expose that as a slash command to answer "what did we decide about X last week"
 across sessions.
 
-- Hooks: `Pgmem op=search`, `CC_ChatLoop` slash-command table.
+- Hooks: `CC_ChatLoop` slash-command table.
 
 ### 4. Parallel tool dispatch (17.4)
 When a turn returns multiple independent tool calls, run them across the
@@ -88,9 +88,7 @@ Background sub-agents that persist across turns.
 
 ## Architectural debt that gates several of the above
 
-**Pgmem single-threaded deadlock (rule 17).** A held `pickup` socket blocks
-the agent daemon from parking its result, which kills agents on timeout.
-Fix this before investing in 17.2 multi-turn sub-agents or streaming results.
-A queued/async result channel unlocks parallel agents, streaming tool output,
-and background task completion — several of the features above become nearly
-free once it's fixed.
+**Memory-plugin deadlock (rule 17).** The memory plugin is single-threaded.
+A held call blocks other agents from storing a result, which kills them on
+timeout. Fix that before investing in multi-turn sub-agents or streaming
+results.

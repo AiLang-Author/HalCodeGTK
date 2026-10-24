@@ -2,6 +2,7 @@
 cc_tools/cc_pgmem_ipc.ailang
 cc_tools/cc_pgmem_ipc.ailang.bak
 cc_tools/cc_relmem_ipc.ailang
+cc_tools/*.ailang.bak
 
 # ── Scratch / dev notes ──────────────────────────────────────────────────────
 deepseek_agent_docs.md

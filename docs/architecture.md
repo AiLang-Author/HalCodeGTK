@@ -2,8 +2,8 @@
 
 > **For engineer onboarding.** Covers every subsystem: entry points, backends, tools,
 > IPC protocol, history, UI, provider config, MCP server mode, sub-agents, and
-> WSL2-specific concerns. Internal details of `cc_relmem_ipc` and `cc_pgmem_ipc`
-> are omitted (proprietary); architectural *role* is covered.
+> WSL2-specific concerns. Pgmem and Relmem are external plugins and are not
+> documented here.
 
 ---
 
@@ -12,7 +12,7 @@
 HalCode9000 is a **native AILang terminal coding agent** — zero Node, zero Python,
 zero Bun. It speaks to multiple LLM backends (Anthropic, OpenAI, DeepSeek, Grok,
 Gemini, Groq, Ollama), dispatches tool calls to 15 persistent IPC worker processes,
-and maintains persistent memory in PostgreSQL. The whole system — main binary +
+and can call external memory plugins. The whole system — main binary +
 all 15 workers — compiles to ~2.2 MB of statically-linked x86-64 Linux ELF.
 
 ```
@@ -69,13 +69,8 @@ all 15 workers — compiles to ~2.2 MB of statically-linked x86-64 Linux ELF.
         │                     │
         ▼                     ▼
  ┌──────────────┐  ┌──────────────────────┐
- │  PostgreSQL  │  │  OlympusRepo         │
- │  (pgmem)     │  │  (relmem —           │
- │              │  │   symbol index)      │
- │  hc_context  │  │                      │
- │  hc_symbols  │  │  HTTP API at         │
- │  hc_sessions │  │  localhost:8000      │
- │  hc_tasks    │  │                      │
+ │  external    │  │  external            │
+ │  plugins     │  │  plugins             │
  └──────────────┘  └──────────────────────┘
 ```
 
@@ -183,15 +178,15 @@ reached via an abstract Unix socket (`@halcode/Name`). Type: `SOCK_SEQPACKET`,
 | 4 | **Write** | `cc_write_ipc.x` | 21K | Overwrite or append string content |
 | 5 | **Edit** | `cc_edit_ipc.x` | 43K | Exact string find-and-replace |
 | 6 | **Bash** | `cc_bash_ipc.x` | 22K | Shell via `/bin/sh -c` |
-| 7 | **Find** | `cc_find_ipc.x` | 22K | `find` on FS or `Relmem` on symstore |
+| 7 | **Find** | `cc_find_ipc.x` | 22K | `find` on the filesystem |
 | 8 | **Grep** | `cc_grep_ipc.x` | 25K | BM/NFA/DFA text search |
 | 9 | **Git** | `cc_git_ipc.x` | 22K | Git subcommand passthrough |
 | 10 | **WebFetch** | `cc_webfetch_ipc.x` | 27K | HTTPS fetch (MbedTLS) |
 | 11 | **JS** | `cc_js_ipc.x` | 74K | QuickJS engine execution |
 | 12 | **MCP** | `cc_mcp_ipc.x` | 31K | Model Context Protocol bridge |
 | 13 | **Agent** | `cc_agent_ipc.x` | 146K | Spawns `HalCode9000.x --agent` |
-| 14 | **Pgmem** | `cc_pgmem_ipc.x` | 28K | PostgreSQL memory (park/search/compact) |
-| 15 | **Relmem** | `cc_relmem_ipc.x` | 78K | Symbol index (OlympusRepo HTTP API) |
+| 14 | **Pgmem** | `cc_pgmem_ipc.x` | 28K | External plugin. Not documented in this repo. |
+| 15 | **Relmem** | `cc_relmem_ipc.x` | 78K | External plugin. Not documented in this repo. |
 
 ### 5.1 Tool registration at boot
 
@@ -223,126 +218,14 @@ fully generic.
 The main binary runs as an x86-64 Linux binary under WSL2. File paths must stay
 within the WSL2 VHDX filesystem. All 15 workers share this constraint.
 Temporary files go to well-known locations (`~/.halcode/`, the model directory,
-or `/tmp`). The Relmem and Pgmem tools use their own persistent storage.
+or `/tmp`).
 
 ---
 
-## 6. `cc_relmem_ipc.x` — Symbolic Memory
+## 6. External memory plugins
 
-**File**: `cc_relmem_ipc.x` (inferred 78 KB)  
-**Source**: Proprietary — compiled from an `ailang` source in the Olympus SDK
-
-### 6.1 Architectural role
-
-Relmem is the **codebase-intelligence tool**. It indexes source files into a 
-semantic symbol database (backed by the OlympusRepo HTTP API at `localhost:8000`)
-and answers queries about:
-
-- **Where** a symbol is defined
-- **What** a symbol calls (callees)
-- **Who** calls a symbol (callers)
-- **Symbols** exported by a file
-- Full-text **query** with similarity ranking
-- **Focus** — pin a symbol for context in subsequent queries
-
-### 6.2 Supported operations
-
-| Operation | Description | Scope |
-|-----------|-------------|-------|
-| `status` | Connection check and repo stats | Current project |
-| `summary` | Project-level statistics | Named project |
-| `query` | Keyword search across indexed files | Supported extensions |
-| `where` | Locate symbol definition | Current project scope |
-| `symbols` | List symbols in a file | Single file |
-| `focus` | Pin symbol for context | Current project |
-| `callers` | Who calls a specific symbol | Current project |
-| `calls` | What a specific symbol calls | Current project |
-| `index` | Force re-index a path | Path + extension filter |
-| `forget` | Remove a file from the index | Single file |
-| `drop` | Drop entire project data | Named project |
-
-### 6.3 Data flow
-
-```
-AILang code
-  │  Relmem(op="symbols", path="/src/main.ailang", project=null, limit=25)
-  ▼
-IPCDispatch  →  4-byte len + JSON  →  @halcode/Relmem
-                                         │
-                                         ▼
-                                    OlympusRepo HTTP API
-                                    localhost:8000
-                                         │
-                                    PostgreSQL hc_symbols
-```
-
-### 6.4 WSL2 rules interaction
-
-Four of the 12 WSL2 safety rules directly constrain Relmem usage:
-
-- **Rule 2**: `Use Relmem op=symbols to locate files` — preferred over `find`
-- **Rule 5**: `NEVER call Relmem op=index on broad paths` — expensive full re-index
-- **Rule 4**: `Pipe unbounded output through head/grep/tail` — always bound results
-- **Rule 9**: `ailang compile & analyze` — check syntax before indexing
-
----
-
-## 7. `cc_pgmem_ipc.x` — PostgreSQL Memory
-
-**File**: `cc_pgmem_ipc.x` (inferred 28 KB)  
-**Source**: Proprietary — compiled from an `ailang` source in the Olympus SDK
-
-### 7.1 Architectural role
-
-Pgmem is the **persistent structured memory** tool. It parks arbitrary text content
-into PostgreSQL for later retrieval, enables full-text search across parked data,
-and provides summarization/compaction via LLM calls. It's used by:
-
-- **The main agent**: Parks large source files, tool outputs, and sub-agent results
-- **Sub-agents (`Agent` tool)**: Pull task context from Pgmem, park results back
-- **The HalCode9000 application itself**: Stores conversation history metadata
-
-### 7.2 Supported operations
-
-| Operation | Description |
-|-----------|-------------|
-| `park` | Store content with key (optionally tagged with scope + kind) |
-| `pickup` | Retrieve content by exact key |
-| `search` | Full-text search with PostgreSQL `tsvector` |
-| `compact` | Summarize content via LLM call (reduces token cost) |
-
-### 7.3 Content scoping
-
-| Scope | Storage | Lifespan |
-|-------|---------|----------|
-| `session` | Temp table or session key | Until process exit |
-| `project` | Project-scoped table | Until explicit `drop` |
-| `persistent` | Global table | Survives across sessions |
-
-### 7.4 Data flow
-
-```
-AILang code
-  │  Pgmem(op="park", content=large_output, key="my_key", scope="session", kind="tool_result")
-  ▼
-IPCDispatch  →  4-byte len + JSON  →  @halcore/Pgmem
-                                         │
-                                         ▼
-                                    PostgreSQL connection
-                                    Host: PG_HOST env / Unix socket
-                                    Database: halcode
-                                         │
-                                    Tables: hc_sessions, hc_tasks, hc_context
-```
-
-### 7.5 The `search` vs `pickup` distinction
-
-The WSL2 rules (**Rule 6**) mandate `op="search"` instead of `op="pickup"`:
-
-- `pickup` — exact key lookup; used when the exact key is known (e.g., sub-agent result key)
-- `search` — full-text search across all parked content; safer for broad queries, returns ranked results
-
----
+Pgmem and Relmem ship as binaries in this repo. Their source, schema, and
+usage are not part of this tree. Do not add that material here.
 
 ## 8. The 12 WSL2 Rules
 
@@ -354,11 +237,11 @@ Hard-coded in `HalCode9000.ailang` (lines 47–71) and injected into every:
 ### 8.1 Complete rules
 
 1. **NEVER use find with / or /mnt or Windows paths.**
-2. **Use Relmem op=symbols to locate files.**
+2. **Locate files with the external code-index plugin. Its usage is not documented here.**
 3. **Scope find to specific subdirectories.**
 4. **Pipe unbounded output through head/grep/tail.**
-5. **NEVER call Relmem op=index on broad paths.**
-6. **Use Pgmem op="search" to extract parked data, DO NOT use op="pickup".**
+5. **Do not ask the code-index plugin for a broad reindex.**
+6. **Read parked memory through the external memory plugin. Its usage is not documented here.**
 7. **Max 30 tool chains in a row, then ask user.**
 8. **NO SUDO.**
 9. **AILang: run `./ailang.x src.ailang dest.x` and `./analyzer.x src.ailang` via Bash to check syntax.**
@@ -375,7 +258,7 @@ Hard-coded in `HalCode9000.ailang` (lines 47–71) and injected into every:
 | 3 | Prevents recursive `find` from hitting `/mnt` or `/proc` drift |
 | 4 | Prevents token overflow from 10,000+ line `find` or `grep` results |
 | 5 | Broad re-index on WSL2 VHDX causes multi-minute stalls |
-| 6 | `pickup` fails silently on stale keys; `search` surfaces all matches |
+| 6 | Memory-plugin usage is not documented in this repo |
 | 7 | Prevents runaway tool loops exhausting the context window |
 | 8 | WSL2 sudo can deadlock on `/etc/sudoers` or Windows interop |
 | 9 | Explicitly confirms AILang source compiles before execution |
@@ -424,7 +307,7 @@ Each backend converts `CC_History` to its wire format:
 
 When the history approaches the provider's context limit, the system:
 1. Truncates old messages (keeps system prompt + last N turns)
-2. Parks truncated content in Pgmem for potential later retrieval
+2. Parks truncated content with the memory plugin for potential later retrieval
 3. Nothing in the current codebase implements automatic summarization (planned)
 
 ---
@@ -620,16 +503,16 @@ HalCode9000.x (main agent)
        └─ HalCode9000.x --agent deepseek:deepseek-chat (headless child)
             ├─ Connects to @halcode/* sockets (parent's tools)
             ├─ Runs one CC_RunTurn()
-            ├─ Parks result in Pgmem
+            ├─ Parks the result with the memory plugin
             └─ Exits
 ```
 
 ### 13.3 Communication
 
-1. **Input**: Task prompt written to child's stdin, or child reads from Pgmem via `context_key`
+1. **Input**: Task prompt written to the child's stdin, or the child reads parked context
 2. **Output**: Child writes last assistant message to stdout; worker captures it
 3. **Side effects**: Child can call all 15 tools (shares parent's IPC sockets)
-4. **Result storage**: Worker parks output in Pgmem under `result_key`
+4. **Result storage**: Worker parks output with the memory plugin
 
 ### 13.4 Safety
 
@@ -777,7 +660,7 @@ HalCode9000/
 
 - **Low latency**: Socket already connected; dispatch is ~200 µs + tool execution
 - **Schema caching**: Tools report schema once at connect, never re-parsed
-- **Stateful tools**: Pgmem keeps DB connection alive; Relmem keeps index warm
+- **Stateful tools**: some workers keep their own connection open across calls
 - **Crash resilience**: Worker crashes don't take down the main binary; auto-reconnect
 
 ### 16.3 Abstract Unix sockets (@halcode/Name)
@@ -807,7 +690,7 @@ HalCode9000/
 ### 17.1 Persistent session resume
 
 PG-backed session storage that survives process restart. Would restore full
-conversation history, tool cache, and auth state from `hc_tasks` table.
+conversation history, tool cache, and auth state.
 
 ### 17.2 Multi-turn sub-agents
 
@@ -828,7 +711,7 @@ parallel across the 15 workers. Currently they execute sequentially.
 ### 17.5 Auto-compaction
 
 When conversation history exceeds context limits, auto-summarize older turns
-via a lightweight LLM call — parked in Pgmem, replaced in the active window.
+via a lightweight LLM call — parked with the memory plugin, replaced in the active window.
 
 ---
 
@@ -844,10 +727,6 @@ via a lightweight LLM call — parked in Pgmem, replaced in the active window.
 | `GEMINI_API_KEY` | Google Gemini API key |
 | `GROK_API_KEY` | xAI Grok API key |
 | `GROQ_API_KEY` | Groq API key |
-| `PG_HOST` | PostgreSQL host for Pgmem |
-| `PG_PORT` | PostgreSQL port (default 5432) |
-| `PG_USER` | PostgreSQL user |
-| `PG_PASSWORD` | PostgreSQL password |
 
 ### Key files
 
@@ -856,7 +735,6 @@ via a lightweight LLM call — parked in Pgmem, replaced in the active window.
 | `~/.halcode/connections/*.json` | User provider overrides |
 | `providers/*.json` | System provider definitions |
 | `~/.halcode/history.json` | Saved conversation history |
-| `~/.pgmem/` | PostgreSQL memory data directory |
 
 ### IPC socket namespace
 

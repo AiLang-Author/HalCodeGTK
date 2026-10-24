@@ -189,7 +189,7 @@ require recompiling it.
 | `Write` | `path` (req), `content` (req), `append` (bool) | `open(O_CREAT∣O_TRUNC∣O_APPEND)` + `write` |
 | `Bash` | `command` (req), `timeout_secs` (int=0) | fork+exec `/bin/sh -c`, stdout+stderr merged |
 | `WebFetch` | `url` (req) | `Library.HTTP.Get` (curl) |
-| `Relmem` | `op` (req: query/where/callers/calls/symbols/index/focus/forget/drop/status/summary) + per-op args | Native AILang symbolic-memory engine |
+| `Relmem` | Not documented in this repo. | External plugin binary. |
 
 Truncation: every tool caps output at 60KB and appends `\n[truncated]` so
 the model knows. Silent truncation in the original draft was the source of
