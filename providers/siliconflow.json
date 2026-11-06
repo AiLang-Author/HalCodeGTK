@@ -46,20 +46,16 @@
       "display": "Gemma 4 12B IT"
     },
     {
-      "id": "nex-agi/Nex-N2-Pro",
-      "display": "Nex-N2-Pro"
-    },
-    {
       "id": "MiniMaxAI/MiniMax-M3",
       "display": "MiniMax-M3"
     },
     {
-      "id": "deepseek-ai/DeepSeek-V4-Flash",
-      "display": "DeepSeek V4 Flash"
-    },
-    {
       "id": "deepseek-ai/DeepSeek-V4-Pro",
       "display": "DeepSeek V4 Pro"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Flash",
+      "display": "DeepSeek V4 Flash"
     },
     {
       "id": "Qwen/Qwen3.6-27B",
@@ -78,20 +74,20 @@
       "display": "zai-org/GLM-5.1"
     },
     {
-      "id": "google/gemma-4-31B-it",
-      "display": "Gemma 4 31B IT"
-    },
-    {
       "id": "google/gemma-4-26B-A4B-it",
       "display": "Gemma 4 26B A4B IT"
+    },
+    {
+      "id": "google/gemma-4-31B-it",
+      "display": "Gemma 4 31B IT"
     },
     {
       "id": "zai-org/GLM-5V-Turbo",
       "display": "zai-org/GLM-5V-Turbo"
     },
     {
-      "id": "Qwen/Qwen3.5-9B",
-      "display": "Qwen/Qwen3.5-9B"
+      "id": "Qwen/Qwen3.5-122B-A10B",
+      "display": "Qwen3.5 122B-A10B"
     },
     {
       "id": "Qwen/Qwen3.5-27B",
@@ -102,16 +98,8 @@
       "display": "Qwen3.5 35B-A3B"
     },
     {
-      "id": "Qwen/Qwen3.5-122B-A10B",
-      "display": "Qwen3.5 122B-A10B"
-    },
-    {
-      "id": "Qwen/Qwen3.5-397B-A17B",
-      "display": "Qwen3.5 397B-A17B"
-    },
-    {
-      "id": "MiniMaxAI/MiniMax-M2.5",
-      "display": "MiniMaxAI/MiniMax-M2.5"
+      "id": "Qwen/Qwen3.5-9B",
+      "display": "Qwen/Qwen3.5-9B"
     },
     {
       "id": "zai-org/GLM-5",
@@ -130,12 +118,12 @@
       "display": "deepseek-ai/DeepSeek-V3.2"
     },
     {
-      "id": "Qwen/Qwen3-VL-32B-Thinking",
-      "display": "Qwen/Qwen3-VL-32B-Thinking"
-    },
-    {
       "id": "Qwen/Qwen3-VL-32B-Instruct",
       "display": "Qwen/Qwen3-VL-32B-Instruct"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-32B-Thinking",
+      "display": "Qwen/Qwen3-VL-32B-Thinking"
     },
     {
       "id": "Qwen/Qwen3-VL-8B-Instruct",
@@ -168,10 +156,22 @@
     {
       "id": "deepseek-ai/DeepSeek-V3.1",
       "display": "deepseek-ai/DeepSeek-V3.1"
+    },
+    {
+      "id": "openai/gpt-oss-120b",
+      "display": "openai/gpt-oss-120b"
+    },
+    {
+      "id": "openai/gpt-oss-20b",
+      "display": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "display": "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     }
   ],
   "default_model": "zai-org/GLM-5.3",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no SILICONFLOW_API_KEY set \u2014 models.dev catalog"
 }

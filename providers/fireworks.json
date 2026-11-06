@@ -10,6 +10,22 @@
   "tier": 2,
   "models": [
     {
+      "id": "accounts/fireworks/models/minimax-m3p1-flash",
+      "display": "MiniMax-M3.1-Flash"
+    },
+    {
+      "id": "accounts/fireworks/routers/deepseek-flash-latest",
+      "display": "DeepSeek Flash Latest"
+    },
+    {
+      "id": "accounts/fireworks/routers/deepseek-v4p1-flash-1017-spot",
+      "display": "DeepSeek V4.1 Flash 1017 Spot"
+    },
+    {
+      "id": "accounts/fireworks/models/muse-spark-open",
+      "display": "Muse Spark Open"
+    },
+    {
       "id": "accounts/fireworks/models/ember-1",
       "display": "Ember-1"
     },
@@ -18,16 +34,8 @@
       "display": "DeepSeek V4.1 Flash"
     },
     {
-      "id": "accounts/fireworks/routers/deepseek-flash-latest",
-      "display": "DeepSeek Flash Latest"
-    },
-    {
-      "id": "accounts/fireworks/routers/glm-fast-latest",
-      "display": "GLM 5.3 Fast (Latest)"
-    },
-    {
-      "id": "accounts/fireworks/routers/glm-5p3-fast",
-      "display": "GLM 5.3 Fast"
+      "id": "accounts/fireworks/routers/deepseek-v4p1-flash-spot",
+      "display": "DeepSeek V4.1 Flash Spot"
     },
     {
       "id": "accounts/fireworks/models/glm-5p3-flash",
@@ -42,16 +50,24 @@
       "display": "GLM 5.3"
     },
     {
+      "id": "accounts/fireworks/routers/glm-5p3-spot",
+      "display": "GLM 5.3 Spot"
+    },
+    {
       "id": "accounts/fireworks/routers/glm-latest",
       "display": "GLM Latest"
     },
     {
-      "id": "accounts/fireworks/models/qwen3p8-2p4t-a95b",
-      "display": "Qwen3.8 2.4T A95B"
+      "id": "accounts/fireworks/routers/glm-5p3-fast",
+      "display": "GLM 5.3 Fast"
     },
     {
-      "id": "accounts/fireworks/models/nemotron-lightning-3p5-30b-a3b",
-      "display": "Nemotron 3.5 Lightning 30B A3B"
+      "id": "accounts/fireworks/routers/glm-fast-latest",
+      "display": "GLM 5.3 Fast (Latest)"
+    },
+    {
+      "id": "accounts/fireworks/models/qwen3p8-2p4t-a95b",
+      "display": "Qwen3.8 2.4T A95B"
     },
     {
       "id": "accounts/fireworks/models/qwen3p8-max",
@@ -70,6 +86,10 @@
       "display": "Kimi K3 Fast"
     },
     {
+      "id": "accounts/fireworks/routers/kimi-k3-spot",
+      "display": "Kimi K3 Spot"
+    },
+    {
       "id": "accounts/fireworks/routers/kimi-fast-latest",
       "display": "Kimi Fast Latest"
     },
@@ -78,28 +98,16 @@
       "display": "Kimi Latest"
     },
     {
-      "id": "accounts/fireworks/models/inkling",
-      "display": "Inkling"
-    },
-    {
       "id": "accounts/fireworks/models/minimax-m3",
       "display": "MiniMax-M3"
     },
     {
       "id": "accounts/fireworks/routers/minimax-latest",
       "display": "MiniMax Latest"
-    },
-    {
-      "id": "accounts/fireworks/models/nemotron-3-ultra-nvfp4",
-      "display": "Nemotron 3 Ultra 550B A55B"
-    },
-    {
-      "id": "accounts/fireworks/models/gpt-oss-120b",
-      "display": "GPT OSS 120B"
     }
   ],
-  "default_model": "accounts/fireworks/models/ember-1",
+  "default_model": "accounts/fireworks/models/muse-spark-open",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no FIREWORKS_API_KEY set \u2014 models.dev catalog"
 }

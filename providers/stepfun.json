@@ -20,18 +20,10 @@
     {
       "id": "step-3.5-flash",
       "display": "Step 3.5 Flash"
-    },
-    {
-      "id": "step-1-32k",
-      "display": "Step 1 (32K)"
-    },
-    {
-      "id": "step-2-16k",
-      "display": "Step 2 (16K)"
     }
   ],
-  "default_model": "step-1-32k",
+  "default_model": "step-5-preview",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no STEPFUN_API_KEY set \u2014 models.dev catalog"
 }

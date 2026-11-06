@@ -30,20 +30,20 @@
       "display": "Grok Build 0.1"
     },
     {
-      "id": "grok-4.20-0309-reasoning",
-      "display": "Grok 4.20 (Reasoning)"
+      "id": "grok-4.20-multi-agent-0309",
+      "display": "Grok 4.20 Multi-Agent"
     },
     {
       "id": "grok-4.20-0309-non-reasoning",
       "display": "Grok 4.20 (Non-Reasoning)"
     },
     {
-      "id": "grok-4.20-multi-agent-0309",
-      "display": "Grok 4.20 Multi-Agent"
+      "id": "grok-4.20-0309-reasoning",
+      "display": "Grok 4.20 (Reasoning)"
     }
   ],
   "default_model": "grok-4.7",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:23Z",
   "note": "HTTP Error 403: Forbidden"
 }

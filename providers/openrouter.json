@@ -26,6 +26,14 @@
       "display": "Anthropic: Claude Opus 5"
     },
     {
+      "id": "openai/gpt-6.1-terra-pro",
+      "display": "OpenAI: GPT-6.1 Terra Pro"
+    },
+    {
+      "id": "openai/gpt-6.1-terra",
+      "display": "OpenAI: GPT-6.1 Terra"
+    },
+    {
       "id": "openai/gpt-6.1-sol-pro",
       "display": "OpenAI: GPT-6.1 Sol Pro"
     },
@@ -34,28 +42,20 @@
       "display": "OpenAI: GPT-6.1 Sol"
     },
     {
-      "id": "openai/gpt-6-luna-pro",
-      "display": "OpenAI: GPT-6 Luna Pro"
+      "id": "google/gemini-omni-1.2-flash",
+      "display": "Google: Gemini Omni 1.2 Flash"
     },
     {
-      "id": "openai/gpt-6-luna",
-      "display": "OpenAI: GPT-6 Luna"
+      "id": "google/gemini-omni-1.1-flash",
+      "display": "Google: Gemini Omni 1.1 Flash"
+    },
+    {
+      "id": "google/gemini-4-argon",
+      "display": "Google: Gemini 4 Argon"
     },
     {
       "id": "google/gemini-3.8-flash",
       "display": "Google: Gemini 3.8 Flash"
-    },
-    {
-      "id": "google/gemini-3.7-flash",
-      "display": "Google: Gemini 3.7 Flash"
-    },
-    {
-      "id": "google/gemini-3.6-flash",
-      "display": "Google: Gemini 3.6 Flash"
-    },
-    {
-      "id": "google/gemini-3.5-flash-lite",
-      "display": "Google: Gemini 3.5 Flash Lite"
     },
     {
       "id": "x-ai/grok-4.7",
@@ -134,8 +134,8 @@
       "display": "Meta: Llama 3.3 70B Instruct"
     },
     {
-      "id": "meta-llama/llama-3.2-1b-instruct",
-      "display": "Meta: Llama 3.2 1B Instruct"
+      "id": "meta-llama/llama-3.1-70b-instruct",
+      "display": "Meta: Llama 3.1 70B Instruct"
     },
     {
       "id": "cohere/command-a-plus",
@@ -154,6 +154,10 @@
       "display": "Cohere: Command R (08-2024)"
     },
     {
+      "id": "minimax/minimax-m3.1-flash",
+      "display": "MiniMax: MiniMax M3.1 Flash"
+    },
+    {
       "id": "minimax/minimax-m3",
       "display": "MiniMax: MiniMax M3"
     },
@@ -164,13 +168,9 @@
     {
       "id": "minimax/minimax-m2.5",
       "display": "MiniMax: MiniMax M2.5"
-    },
-    {
-      "id": "minimax/minimax-m2-her",
-      "display": "MiniMax: MiniMax M2-her"
     }
   ],
   "default_model": "anthropic/claude-sonnet-5.5",
   "source": "live",
-  "fetched_at": "2026-10-09T19:08:55Z"
+  "fetched_at": "2026-11-06T01:26:23Z"
 }

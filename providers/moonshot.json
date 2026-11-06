@@ -10,24 +10,32 @@
   "tier": 2,
   "models": [
     {
-      "id": "kimi-k3",
-      "display": "Kimi K3"
+      "id": "kimi-k3.1-pro",
+      "display": "Kimi K3.1 Pro"
     },
     {
-      "id": "kimi-k2.7-code-highspeed",
-      "display": "Kimi K2.7 Code HighSpeed"
+      "id": "kimi-k3.1-pro-highspeed",
+      "display": "Kimi K3.1 Pro Highspeed"
+    },
+    {
+      "id": "kimi-k3",
+      "display": "Kimi K3"
     },
     {
       "id": "kimi-k2.7-code",
       "display": "Kimi K2.7 Code"
     },
     {
+      "id": "kimi-k2.7-code-highspeed",
+      "display": "Kimi K2.7 Code HighSpeed"
+    },
+    {
       "id": "kimi-k2.6",
       "display": "Kimi K2.6"
     }
   ],
-  "default_model": "kimi-k3",
+  "default_model": "kimi-k3.1-pro",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no MOONSHOT_API_KEY set \u2014 models.dev catalog"
 }

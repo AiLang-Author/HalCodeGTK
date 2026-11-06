@@ -1619,13 +1619,15 @@ Function.Desk_PollPickup {
             }
             SetByte(Desk.pick, Desk.i, 0)
             Desk.c = GetByte(Desk.pick, Desk.x)
-            IfCondition And(EqualTo(Desk.c, 80), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+            // Records are "P ", "T ", "W ", "E ", "S ".
+            // A bare PATH=/boot/home matched P and showed TH=/boot/home.
+            IfCondition And(EqualTo(Desk.c, 80), EqualTo(GetByte(Desk.pick, Add(Desk.x, 1)), 32)) ThenBlock: {
                 Desk_CopyZ(Desk.proj, Add(Desk.pick, Add(Desk.x, 2)))
             }
-            IfCondition And(EqualTo(Desk.c, 84), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+            IfCondition And(EqualTo(Desk.c, 84), EqualTo(GetByte(Desk.pick, Add(Desk.x, 1)), 32)) ThenBlock: {
                 Desk_CopyZ(Desk.thread, Add(Desk.pick, Add(Desk.x, 2)))
             }
-            IfCondition And(EqualTo(Desk.c, 87), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+            IfCondition And(EqualTo(Desk.c, 87), EqualTo(GetByte(Desk.pick, Add(Desk.x, 1)), 32)) ThenBlock: {
                 Desk.w = StringLength(Add(Desk.pick, Add(Desk.x, 2)))
                 IfCondition GreaterThan(Desk.w, 199) ThenBlock: { Desk.w = 199 }
                 Desk.h2 = 0
@@ -1635,11 +1637,12 @@ Function.Desk_PollPickup {
                 }
                 SetByte(Desk.state, Desk.w, 0)
             }
-            IfCondition And(EqualTo(Desk.c, 69), NotEqual(GetByte(Desk.pick, Add(Desk.x, 1)), 0)) ThenBlock: {
+            IfCondition And(EqualTo(Desk.c, 69), EqualTo(GetByte(Desk.pick, Add(Desk.x, 1)), 32)) ThenBlock: {
                 Desk_CopyZ(Desk.line, Add(Desk.pick, Add(Desk.x, 2)))
                 Desk_LogPush(Desk.line)
             }
-            IfCondition And(EqualTo(Desk.c, 83), LessThan(Desk.sesn, 8)) ThenBlock: {
+            IfCondition And(EqualTo(Desk.c, 83), EqualTo(GetByte(Desk.pick, Add(Desk.x, 1)), 32)) ThenBlock: {
+                IfCondition LessThan(Desk.sesn, 8) ThenBlock: {
                 Desk_CopyZ(Add(Desk.sesbase, Multiply(Desk.sesn, 81)), Add(Desk.pick, Add(Desk.x, 2)))
                 Desk.h2 = 0
                 WhileLoop And(LessThan(Desk.h2, 40), NotEqual(GetByte(Desk.pick, Add(Add(Desk.x, 2), Desk.h2)), 0)) {
@@ -1650,6 +1653,7 @@ Function.Desk_PollPickup {
                 }
                 SetByte(Add(Desk.sesids, Multiply(Desk.sesn, 81)), Desk.h2, 0)
                 Desk.sesn = Add(Desk.sesn, 1)
+                }
             }
             Desk.x = Add(Desk.i, 1)
         }
@@ -1929,10 +1933,10 @@ Function.Desk_DrawContent {
             Desk_DrawVScroll(Subtract(Add(Desk.x, Desk.w), Add(Desk.sbw, 2)), Add(Desk.by, 22), Subtract(Desk.h2, 28), Desk.li, Desk.modn, Desk.modoff)
             Desk_DrawBtn(Add(Desk.cx, 8), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "UPDATE", 0)
             IfCondition GreaterEqual(Desk.curprv, 0) ThenBlock: {
-                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "CONFIGURE", 1)
+                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "API KEY", 1)
             }
             ElseBlock: {
-                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "CONFIGURE", 0)
+                Desk_DrawBtn(Add(Desk.cx, 156), Subtract(Add(Desk.cy, AppDesk.CH(idx)), 32), 140, 26, "API KEY", 0)
             }
             Desk_DrawKeyStatus(Add(Desk.cx, 8), Add(Add(Desk.by, Desk.h2), 2))
         }
@@ -1984,7 +1988,7 @@ Function.Desk_DrawContent {
             }
             Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 124), "providers: anthropic deepseek gemini", FB_RGB(232, 238, 248))
             Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 140), "            groq ollama openai xai", FB_RGB(232, 238, 248))
-            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 164), "./setup.sh writes ~/.halcode/", FB_RGB(154, 164, 184))
+            Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 164), "Models: API KEY, paste, Enter", FB_RGB(154, 164, 184))
         }
         IfCondition EqualTo(idx, Desk.winses) ThenBlock: {
             Desk_DrawTxt(Add(Desk.cx, 12), Add(Desk.cy, 4), "Session", FB_RGB(0, 196, 198))

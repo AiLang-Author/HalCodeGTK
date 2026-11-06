@@ -10,6 +10,38 @@
   "tier": 2,
   "models": [
     {
+      "id": "tencent/Hy4",
+      "display": "Hy4"
+    },
+    {
+      "id": "moonshotai/Kimi-K2.7-Code",
+      "display": "Kimi K2.7 Code"
+    },
+    {
+      "id": "zai-org/GLM-5.3",
+      "display": "GLM 5.3"
+    },
+    {
+      "id": "zai-org/GLM-5.2-Fast",
+      "display": "GLM 5.2 Fast"
+    },
+    {
+      "id": "Qwen/Qwen3.8-2.4T-A95B",
+      "display": "Qwen3.8 2.4T A95B"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+      "display": "DeepSeek V4.1 Flash 1017"
+    },
+    {
+      "id": "Qwen/Qwen3.8-Max-0902",
+      "display": "Qwen3.8 Max 0902"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+      "display": "DeepSeek V4 Pro 0813"
+    },
+    {
       "id": "Qwen/Qwen3.8-27B-TEE",
       "display": "Qwen3.8 27B TEE"
     },
@@ -20,10 +52,6 @@
     {
       "id": "moonshotai/Kimi-K3-TEE",
       "display": "Kimi K3 TEE"
-    },
-    {
-      "id": "Nemotron-3-Nano-Omni-30B-TEE",
-      "display": "Nemotron 3 Nano Omni 30B TEE"
     },
     {
       "id": "zai-org/GLM-5.2-TEE",
@@ -50,24 +78,12 @@
       "display": "Qwen3.5 397B A17B TEE"
     },
     {
-      "id": "unsloth/Mistral-Nemo-Instruct-2407-TEE",
-      "display": "Mistral Nemo Instruct 2407 TEE"
-    },
-    {
-      "id": "Qwen/Qwen3-32B-TEE",
-      "display": "Qwen3 32B TEE"
-    },
-    {
-      "id": "Qwen/Qwen3-235B-A22B-Thinking-2507-TEE",
-      "display": "Qwen3 235B A22B Thinking 2507 TEE"
-    },
-    {
       "id": "deepseek-ai/DeepSeek-V3.2-TEE",
       "display": "DeepSeek V3.2 TEE"
     }
   ],
-  "default_model": "Qwen/Qwen3.8-27B-TEE",
+  "default_model": "tencent/Hy4",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no CHUTES_API_KEY set \u2014 models.dev catalog"
 }

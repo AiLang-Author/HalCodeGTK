@@ -10,6 +10,10 @@
   "tier": 2,
   "models": [
     {
+      "id": "mercury-3",
+      "display": "Mercury 3"
+    },
+    {
       "id": "mercury-2.5",
       "display": "Mercury 2.5"
     },
@@ -22,8 +26,8 @@
       "display": "Mercury 2"
     }
   ],
-  "default_model": "mercury-2.5",
+  "default_model": "mercury-3",
   "source": "catalog",
-  "fetched_at": "2026-10-09T19:08:56Z",
+  "fetched_at": "2026-11-06T01:26:24Z",
   "note": "no INCEPTION_API_KEY set \u2014 models.dev catalog"
 }

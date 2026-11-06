@@ -40,6 +40,7 @@ FixedPool.HistState {
     "count":         Initialize=0, CanChange=True
     "initialized":   Initialize=0, CanChange=True
     "session_id":    Initialize=0, CanChange=True
+    "session_buf":   Initialize=0, CanChange=True
     "title":         Initialize=0, CanChange=True
     "last_text":     Initialize=0, CanChange=True
     "last_text_len": Initialize=0, CanChange=True
@@ -408,9 +409,37 @@ Function.History.GetSessionID {
     Body: { ReturnValue(HistState.session_id) }
 }
 
+// Own the id. Callers pass stack and scratch buffers (session.txt is freed
+// right after this), and a later StringConcat reuses that storage. A stored
+// pointer then becomes a [MEM-STAGE] line and the turn is saved under that
+// key, so the real session id loads an empty shell.
 Function.History.SetSessionID {
     Input: id: Address
-    Body: { HistState.session_id = id }
+    Body: {
+        IfCondition EqualTo(id, 0) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(id, HistState.session_buf) ThenBlock: {
+            HistState.session_id = HistState.session_buf
+            ReturnValue(0)
+        }
+        n = StringLength(id)
+        IfCondition Or(LessThan(n, 1), GreaterThan(n, 80)) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(HistState.session_buf, 0) ThenBlock: {
+            HistState.session_buf = Allocate(96)
+        }
+        IfCondition EqualTo(HistState.session_buf, 0) ThenBlock: {
+            HistState.session_id = 0
+            ReturnValue(0)
+        }
+        MemoryCopy(HistState.session_buf, id, n)
+        SetByte(HistState.session_buf, n, 0)
+        HistState.session_id = HistState.session_buf
+    }
 }
 
 Function.History.GetTitle {
